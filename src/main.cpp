@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <fstream>
 #include "BoundedBuffer.hpp"
+#include "TableRegistry.hpp"
 #include "NetworkReceiver.hpp"
 #include "ParquetWriter.hpp"
 
@@ -58,25 +59,17 @@ int main(int argc, char* argv[]) {
     std::cout << "Starting CDC Daemon with connection string: " << conninfo << std::endl;
 
     try {
-        // Instantiate the bounded buffer with a capacity of 10,000 Unprocessed WAL messages
+        auto registry = std::make_shared<TableRegistry>();
         BoundedBuffer<WalMessage> buffer(10000);
 
-        // Instantiate the ParquetWriter, which flushes after 10,000 accumulated rows by default
-        ParquetWriter writer(buffer, 10000);
+        ParquetWriter writer(buffer, registry, 100);
         
-        // Let the signal handler access the writer
         g_writer = &writer;
-        
-        // Start the background consumer thread
         writer.start();
 
-        // Instantiate the NetworkReceiver to connect to Postgres
-        NetworkReceiver receiver(conninfo, buffer);
+        NetworkReceiver receiver(conninfo, buffer, registry);
         
-        // Let the signal handler access the receiver
         g_receiver = &receiver;
-        
-        // Run the receiver loop (blocks the main thread)
         receiver.run(); 
 
         std::cout << "Receiver run-loop exited. Stopping writer..." << std::endl;

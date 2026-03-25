@@ -20,6 +20,7 @@ add_executable(pg_delta_lake_cdc
     src/main.cpp
     src/NetworkReceiver.cpp
     src/ParquetWriter.cpp
+    src/TableWriter.cpp
 )
 
 target_include_directories(pg_delta_lake_cdc PRIVATE 

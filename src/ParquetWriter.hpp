@@ -1,18 +1,18 @@
 #pragma once
 
 #include "BoundedBuffer.hpp"
-#include "NetworkReceiver.hpp"
+#include "NetworkReceiver.hpp" // For WalMessage
+#include "TableRegistry.hpp"
+#include "TableWriter.hpp"
 #include <string>
 #include <atomic>
 #include <memory>
 #include <thread>
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <parquet/arrow/writer.h>
+#include <unordered_map>
 
 class ParquetWriter {
 public:
-    ParquetWriter(BoundedBuffer<WalMessage>& buffer, size_t row_group_size = 10000);
+    ParquetWriter(BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry, size_t row_group_size = 100);
     ~ParquetWriter();
 
     void start();
@@ -20,17 +20,13 @@ public:
 
 private:
     BoundedBuffer<WalMessage>& buffer_;
+    std::shared_ptr<TableRegistry> registry_;
     size_t row_group_size_;
     std::atomic<bool> keep_running_;
     std::thread worker_thread_;
-
-    std::shared_ptr<arrow::Schema> schema_;
-    std::unique_ptr<arrow::Int32Builder> id_builder_;
-    std::unique_ptr<arrow::StringBuilder> data_builder_;
-    int current_rows_;
+    std::unordered_map<uint32_t, std::unique_ptr<TableWriter>> writers_;
 
     void run();
     void processMessage(const WalMessage& msg);
-    void flushPartition();
-    void resetBuilders();
+    void flushAll();
 };

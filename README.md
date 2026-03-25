@@ -5,6 +5,14 @@ A C++20 standalone Linux daemon that acts as a PostgreSQL logical replication cl
 ## Overview
 This daemon performs Change Data Capture (CDC) utilizing PostgreSQL's native `pgoutput` plugin. It asynchronously pulls WAL insert streams, parses them, and pivots them into heavily optimized columnar layouts utilizing the Apache Arrow ecosystem.
 
+## Features
+
+- **Dynamic Schema Extraction:** On startup, the daemon queries PostgreSQL's `information_schema` and natively maps PostgreSQL data types to Apache Arrow types (`Int32Builder`, `DoubleBuilder`, `BooleanBuilder`, `StringBuilder`, etc.).
+- **Multi-Table Streaming:** Actively parses `pgoutput` Relation ('R') messages, mapping binary OIDs directly to schema/table names to support infinite concurrent dynamic tables!
+- **Zero-Config Parquet Routing:** Routes all incoming inserts to dedicated `TableWriter` instances per table!
+- **Low-Latency Flushing:** Drops highly optimized `.parquet` buffers securely to disk the absolute microsecond any individual table hits exactly 100 rows.
+
+## Architecture
 To prevent backpressure and out-of-memory errors on high ingestion spikes, a concurrent Bounded Buffer cleanly separates the network listener thread from the disk-writing Parquet conversion thread.
 
 ## Dependencies
