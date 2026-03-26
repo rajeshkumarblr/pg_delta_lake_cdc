@@ -105,7 +105,13 @@ void NetworkReceiver::connect() {
 }
 
 void NetworkReceiver::startLogicalReplication() {
-    std::string query = "START_REPLICATION SLOT \"hn_cdc_stream_slot\" LOGICAL 0/0 (proto_version '1', publication_names 'hn_cdc_stream');";
+    const char* env_slot = std::getenv("PG_SLOT_NAME");
+    const char* env_pub = std::getenv("PG_PUBLICATION_NAME");
+    
+    std::string slot_name = env_slot ? env_slot : "hn_cdc_stream_slot";
+    std::string pub_name = env_pub ? env_pub : "hn_cdc_stream";
+
+    std::string query = "START_REPLICATION SLOT \"" + slot_name + "\" LOGICAL 0/0 (proto_version '1', publication_names '" + pub_name + "');";
     PGresult* res = PQexec(conn_, query.c_str());
     
     if (PQresultStatus(res) != PGRES_COPY_BOTH) {
@@ -114,7 +120,7 @@ void NetworkReceiver::startLogicalReplication() {
         throw std::runtime_error("Could not start logical replication: " + err);
     }
     PQclear(res);
-    std::cout << "Started logical replication stream on slot 'hn_cdc_stream_slot'." << std::endl;
+    std::cout << "Started logical replication stream on slot '" << slot_name << "'." << std::endl;
 }
 
 void NetworkReceiver::receiveLoop() {

@@ -4,8 +4,8 @@
 #include <arpa/inet.h>
 #include <cstring>
 
-TableWriter::TableWriter(const TableInfo& info, size_t row_group_size)
-    : info_(info), row_group_size_(row_group_size), current_rows_(0) {
+TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir, size_t row_group_size)
+    : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), row_group_size_(row_group_size), current_rows_(0) {
     setupSchemaAndBuilders();
 }
 
@@ -39,6 +39,10 @@ void TableWriter::setupSchemaAndBuilders() {
         fields.push_back(arrow::field(col.name, arrow_type, col.is_nullable));
     }
     
+    // Add metadata columns
+    fields.push_back(arrow::field("_cdc_op", arrow::utf8(), false));
+    fields.push_back(arrow::field("_cdc_timestamp", arrow::int64(), false));
+    
     schema_ = arrow::schema(fields);
     resetBuilders();
 }
@@ -66,7 +70,14 @@ void TableWriter::resetBuilders() {
         }
         builders_.push_back(builder);
     }
+    
+    // Builders for metadata
+    builders_.push_back(std::make_shared<arrow::StringBuilder>(pool)); // _cdc_op
+    builders_.push_back(std::make_shared<arrow::Int64Builder>(pool));   // _cdc_timestamp
+    
     current_rows_ = 0;
+    insert_count_ = 0;
+    update_count_ = 0;
 }
 
 void TableWriter::appendRow(const char* data, size_t length) {
@@ -150,9 +161,24 @@ void TableWriter::appendRow(const char* data, size_t length) {
     }
     
     if (all_ok) {
+        // Append metadata columns
+        auto* op_builder = static_cast<arrow::StringBuilder*>(builders_[builders_.size() - 2].get());
+        auto* ts_builder = static_cast<arrow::Int64Builder*>(builders_[builders_.size() - 1].get());
+        
+        std::string op_str = (msg_type == 'I') ? "INSERT" : "UPDATE";
+        uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        
+        if (!op_builder->Append(op_str).ok()) all_ok = false;
+        if (!ts_builder->Append(ms).ok()) all_ok = false;
+    }
+    
+    if (all_ok) {
         current_rows_++;
-        if (current_rows_ == 1 || current_rows_ % 100 == 0) {
-            std::cout << "TableWriter [" << info_.table_name << "]: Buffered " << current_rows_ << " inserts..." << std::endl;
+        if (msg_type == 'I') insert_count_++;
+        else if (msg_type == 'U') update_count_++;
+
+        if (current_rows_ % 10 == 0) {
+            std::cout << "TableWriter [" << info_.table_name << "]: Progress " << current_rows_ << "/100 (Inserts: " << insert_count_ << ", Updates: " << update_count_ << ")" << std::endl;
         }
     }
     
@@ -175,14 +201,13 @@ void TableWriter::flushPartition() {
     
     std::shared_ptr<arrow::Table> table = arrow::Table::Make(schema_, arrays);
     
-    auto now = std::chrono::system_clock::now();
-    uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    std::string filename = "output_" + info_.schema + "_" + info_.table_name + "_" + std::to_string(ms) + ".parquet";
+    std::string filename = info_.table_name + "_" + std::to_string(++file_counter_) + ".parquet";
+    std::string full_path = output_dir_.empty() ? filename : (output_dir_ + "/" + filename);
     
     std::shared_ptr<arrow::io::FileOutputStream> outfile;
     PARQUET_ASSIGN_OR_THROW(
         outfile,
-        arrow::io::FileOutputStream::Open(filename)
+        arrow::io::FileOutputStream::Open(full_path)
     );
     
     PARQUET_THROW_NOT_OK(

@@ -6,6 +6,7 @@
 #include "TableRegistry.hpp"
 #include "NetworkReceiver.hpp"
 #include "ParquetWriter.hpp"
+#include <filesystem>
 
 // Global pointers for signal handler
 NetworkReceiver* g_receiver = nullptr;
@@ -56,13 +57,23 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    std::string output_dir = "data";
+    const char* env_output_dir = std::getenv("OUTPUT_DIR");
+    if (env_output_dir) {
+        output_dir = env_output_dir;
+    }
+
+    if (!output_dir.empty()) {
+        std::filesystem::create_directories(output_dir);
+    }
+
     std::cout << "Starting CDC Daemon with connection string: " << conninfo << std::endl;
 
     try {
         auto registry = std::make_shared<TableRegistry>();
         BoundedBuffer<WalMessage> buffer(10000);
 
-        ParquetWriter writer(buffer, registry, 100);
+        ParquetWriter writer(buffer, registry, output_dir, 100);
         
         g_writer = &writer;
         writer.start();
