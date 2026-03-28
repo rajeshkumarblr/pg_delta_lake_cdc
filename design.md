@@ -4,36 +4,74 @@ This document describes the high-level architecture, threading model, and data f
 
 ## High-Level Architecture
 
-The daemon is designed as a **Producer-Consumer** system separated by a thread-safe **Bounded Buffer**. This architecture prevents network ingestion spikes from causing memory overflow or blocking the PostgreSQL replication stream.
+The daemon follows a **Producer-Consumer** pattern to handle high-speed data streams without blocking the PostgreSQL replication slot.
 
 ```mermaid
-graph LR
-    subgraph "PostgreSQL"
+graph TD
+    subgraph "PostgreSQL Server"
         WAL["WAL (Write Ahead Log)"]
-        PUB["Publication"]
-        SLOT["Replication Slot (pgoutput)"]
+        PUB["Publication (hn_stories_pub)"]
+        SLOT["Logical Slot (hn_stories_slot)"]
     end
 
-    subgraph "CDC Daemon"
-        NR["NetworkReceiver (Producer Thread)"]
-        BB["BoundedBuffer (Thread-Safe Queue)"]
-        PW["ParquetWriter (Consumer Thread)"]
-        TR["TableRegistry"]
-        TW["TableWriter (per-table)"]
+    subgraph "CDC Daemon (C++)"
+        subgraph "Producer Layer"
+            NR["NetworkReceiver"]
+            TR["TableRegistry (Schema Map)"]
+        end
+
+        BB[("Bounded Buffer<br/>(Thread-Safe Queue)")]
+
+        subgraph "Consumer Layer"
+            PW["ParquetWriter"]
+            TW["TableWriters<br/>(Per-Table Workers)"]
+        end
     end
 
-    subgraph "Storage"
-        PQ["Parquet Files (data/)"]
+    subgraph "Local Storage"
+        PQ["Parquet Files (.parquet)"]
     end
 
-    WAL --> SLOT
-    SLOT --> NR
+    WAL --> PUB
+    PUB --> SLOT
+    SLOT -- "pgoutput" --> NR
     NR -- "WalMessage" --> BB
     BB -- "WalMessage" --> PW
-    PW -- "Table Map" --> TW
-    TW -- "Sequential Writes" --> PQ
-    NR -- "Fetch Schema" --> TR
-    PW -- "Lookup Mapping" --> TR
+    PW --> TW
+    TW -- "Write" --> PQ
+    
+    NR -. "Fetch Metadata" .-> TR
+    PW -. "Lookup Schema" .-> TR
+```
+
+## End-to-End Test Architecture
+
+The integrated test suite provides a full-stack environment to validate the pipeline under load.
+
+```mermaid
+graph TD
+    subgraph "Internet"
+        HN["Hacker News API"]
+    end
+
+    subgraph "Docker Compose Stack"
+        IG["hn-ingest (Go)"]
+        DB[("PostgreSQL 16")]
+        DA["cdc-daemon (C++)"]
+    end
+
+    subgraph "Output"
+        DT["Parquet Data Lake"]
+    end
+
+    HN -- "REST / 10s" --> IG
+    IG -- "High-Speed SQL Inserts" --> DB
+    DB -- "Logical Replication" --> DA
+    DA -- "Columnar Flush" --> DT
+
+    style IG fill:#f9f,stroke:#333,stroke-width:2px
+    style DA fill:#bbf,stroke:#333,stroke-width:2px
+    style DB fill:#dfd,stroke:#333,stroke-width:2px
 ```
 
 ## Core Components
