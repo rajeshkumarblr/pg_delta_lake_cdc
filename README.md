@@ -18,70 +18,10 @@ This daemon performs Change Data Capture (CDC) utilizing PostgreSQL's native `pg
 The daemon utilizes a **Producer-Consumer** pattern separated by a thread-safe **Bounded Buffer**.
 
 ### CDC Daemon Internals
-```mermaid
-graph TD
-    subgraph "PostgreSQL Server"
-        WAL["WAL (Write Ahead Log)"]
-        PUB["Publication (hn_stories_pub)"]
-        SLOT["Logical Slot (hn_stories_slot)"]
-    end
-
-    subgraph "CDC Daemon (C++)"
-        subgraph "Producer Layer"
-            NR["NetworkReceiver"]
-            TR["TableRegistry (Schema Map)"]
-        end
-
-        BB[("Bounded Buffer<br/>(Thread-Safe Queue)")]
-
-        subgraph "Consumer Layer"
-            PW["ParquetWriter"]
-            TW["TableWriters<br/>(Per-Table Workers)"]
-        end
-    end
-
-    subgraph "Local Storage"
-        PQ["Parquet Files (.parquet)"]
-    end
-
-    WAL --> PUB
-    PUB --> SLOT
-    SLOT -- "pgoutput" --> NR
-    NR -- "WalMessage" --> BB
-    BB -- "WalMessage" --> PW
-    PW --> TW
-    TW -- "Write" --> PQ
-    
-    NR -. "Fetch Metadata" .-> TR
-    PW -. "Lookup Schema" .-> TR
-```
+![Internal Architecture](images/architecture.png)
 
 ### End-to-End Stress Test Environment
-```mermaid
-graph TD
-    subgraph "Internet"
-        HN["Hacker News API"]
-    end
-
-    subgraph "Docker Compose Stack"
-        IG["hn- ingest (Go)"]
-        DB[("PostgreSQL 16")]
-        DA["cdc-daemon (C++)"]
-    end
-
-    subgraph "Output"
-        DT["Parquet Data Lake"]
-    end
-
-    HN -- "REST / 10s" --> IG
-    IG -- "High-Speed SQL Inserts" --> DB
-    DB -- "Logical Replication" --> DA
-    DA -- "Columnar Flush" --> DT
-
-    style IG fill:#f9f,stroke:#333,stroke-width:2px
-    style DA fill:#bbf,stroke:#333,stroke-width:2px
-    style DB fill:#dfd,stroke:#333,stroke-width:2px
-```
+![End-to-End Test Architecture](images/overview.png)
 
 For more detailed architecture notes, see [design.md](design.md).
 ## Quick Start with Docker (Recommended)
