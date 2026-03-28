@@ -12,12 +12,17 @@ This daemon performs Change Data Capture (CDC) utilizing PostgreSQL's native `pg
 - **Zero-Config Parquet Routing:** Routes all incoming inserts/updates to dedicated `TableWriter` instances per table!
 - **CDC Metadata Injection:** Automatically injects `_cdc_op` (INSERT/UPDATE) and `_cdc_timestamp` (event time in ms) into every Parquet row!
 - **Sequential Parquet Naming:** Generates clean, sequential files (e.g., `stories_1.parquet`, `stories_2.parquet`) for easier downstream ingestion.
-- **Low-Latency Flushing:** Commits highly optimized `.parquet` files to a configurable output directory whenever any individual table hits a threshold (now 100 rows).
+## Quick Start with Docker (Recommended)
+The easiest way to see the system in action is using the integrated test infrastructure. This launches PostgreSQL, a high-speed Hacker News ingestion service, and the CDC daemon in a single command.
 
-## Architecture
-To prevent backpressure and out-of-memory errors on high ingestion spikes, a concurrent Bounded Buffer cleanly separates the network listener thread from the disk-writing Parquet conversion thread.
+```bash
+cd test
+docker-compose up --build
+```
+Parquet files will be generated in `test/data/`.
 
-## Dependencies
+## Manual Compilation
+### Dependencies
 - **CMake** 3.16+
 - **C++20 Compiler**
 - **PostgreSQL Client Utilities** (`libpq-dev`)
@@ -33,7 +38,7 @@ sudo apt update
 sudo apt install -y -V libarrow-dev libparquet-dev libpq-dev
 ```
 
-## Compilation
+### Build
 ```bash
 cmake -B build
 cmake --build build
@@ -49,11 +54,14 @@ PG_PUBLICATION_NAME=hn_stories_pub
 OUTPUT_DIR=data
 ```
 
-- **PG_SLOT_NAME**: The logical replication slot name.
-- **PG_PUBLICATION_NAME**: The Postgres publication name.
-- **OUTPUT_DIR**: The directory where `.parquet` files will be stored (automatically created).
+## Testing & Stress Testing
+The `test/` directory contains a high-speed ingestion service (`hn_ingest`) designed to stress-test the CDC pipeline.
 
-## Deployment & Running
+1.  **Stress Mode**: The ingestion service fetches 500 new stories every 10 seconds.
+2.  **Row Threshold**: The daemon is configured to flush Parquet files every 100 rows to demonstrate real-time conversion.
+3.  **Consolidated Repo**: Everything needed for the test is contained within `test/`, including `docker-compose.yaml` and `init.sql`.
+
+## Deployment
 1. **Initialize PostgreSQL Publication**:
    ```sql
    CREATE PUBLICATION hn_stories_pub FOR TABLE stories;

@@ -63,6 +63,12 @@ Responsible for the final conversion to columnar format:
 -   **CDC Metadata Injection**: Automatically appends `_cdc_op` and `_cdc_timestamp` to every row.
 -   **Sequential Flushing**: Once a table hits **100 rows**, it flushes a new Parquet file (e.g., `stories_1.parquet`) to the `data/` directory.
 
+## Stress Testing & Verification
+A dedicated `test/` directory provides a high-speed ingestion framework:
+- **hn_ingest**: A Go service that pulls live Hacker News data.
+- **Stress Mode**: Fetches 500 items per interval to test daemon throughput.
+- **Simplified Storage**: All AI-related overhead (embeddings/summaries) has been removed to maximize raw ingestion speed.
+
 ## Data Flow: From Postgres to Parquet
 
 ```mermaid
