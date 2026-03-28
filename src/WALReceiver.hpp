@@ -13,10 +13,10 @@ struct WalMessage {
     std::vector<char> payload;
 };
 
-class NetworkReceiver {
+class WALReceiver {
 public:
-    NetworkReceiver(const std::string& conninfo, BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry);
-    ~NetworkReceiver();
+    WALReceiver(const std::string& conninfo, BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry);
+    ~WALReceiver();
 
     void run();
     void stop();

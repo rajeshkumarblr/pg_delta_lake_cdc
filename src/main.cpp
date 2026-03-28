@@ -4,12 +4,12 @@
 #include <fstream>
 #include "BoundedBuffer.hpp"
 #include "TableRegistry.hpp"
-#include "NetworkReceiver.hpp"
+#include "WALReceiver.hpp"
 #include "ParquetWriter.hpp"
 #include <filesystem>
 
 // Global pointers for signal handler
-NetworkReceiver* g_receiver = nullptr;
+WALReceiver* g_receiver = nullptr;
 ParquetWriter* g_writer = nullptr;
 
 void signalHandler(int signum) {
@@ -78,7 +78,7 @@ int main(int argc, char* argv[]) {
         g_writer = &writer;
         writer.start();
 
-        NetworkReceiver receiver(conninfo, buffer, registry);
+        WALReceiver receiver(conninfo, buffer, registry);
         
         g_receiver = &receiver;
         receiver.run(); 

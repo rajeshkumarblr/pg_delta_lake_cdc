@@ -16,8 +16,8 @@ The integrated test suite provides a full-stack environment to validate the pipe
 
 ## Core Components
 
-### 1. NetworkReceiver (Producer)
-The `NetworkReceiver` is the entry point for data ingestion.
+### 1. WALReceiver (Producer)
+The `WALReceiver` is the entry point for data ingestion.
 -   **Schema Fetching**: On startup, it queries `information_schema.columns` to build an initial mapping of table structures.
 -   **Replication Loop**: It uses `libpq` to establish a logical replication connection.
 -   **Message Handling**: It parses `pgoutput` messages:
@@ -52,7 +52,7 @@ A dedicated `test/` directory provides a high-speed ingestion framework:
 ```mermaid
 sequenceDiagram
     participant PG as PostgreSQL
-    participant NR as NetworkReceiver
+    participant NR as WALReceiver
     participant BB as BoundedBuffer
     participant PW as ParquetWriter
     participant TW as TableWriter

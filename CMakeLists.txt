@@ -18,7 +18,7 @@ endif()
 
 add_executable(pg_delta_lake_cdc
     src/main.cpp
-    src/NetworkReceiver.cpp
+    src/WALReceiver.cpp
     src/ParquetWriter.cpp
     src/TableWriter.cpp
 )

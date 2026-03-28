@@ -1,25 +1,25 @@
-#include "NetworkReceiver.hpp"
+#include "WALReceiver.hpp"
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
 #include <arpa/inet.h>
 
-NetworkReceiver::NetworkReceiver(const std::string& conninfo, BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry)
+WALReceiver::WALReceiver(const std::string& conninfo, BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry)
     : conninfo_(conninfo), buffer_(buffer), registry_(std::move(registry)), conn_(nullptr), keep_running_(true) {
 }
 
-NetworkReceiver::~NetworkReceiver() {
+WALReceiver::~WALReceiver() {
     stop();
     if (conn_) {
         PQfinish(conn_);
     }
 }
 
-void NetworkReceiver::stop() {
+void WALReceiver::stop() {
     keep_running_ = false;
 }
 
-void NetworkReceiver::fetchSchemas(PGconn* normal_conn) {
+void WALReceiver::fetchSchemas(PGconn* normal_conn) {
     std::cout << "Fetching schema definitions from PostgreSQL..." << std::endl;
     // We get columns for all tables in 'public' schema
     std::string query = 
@@ -71,7 +71,7 @@ void NetworkReceiver::fetchSchemas(PGconn* normal_conn) {
     std::cout << "Schema definitions successfully populated in registry." << std::endl;
 }
 
-void NetworkReceiver::connect() {
+void WALReceiver::connect() {
     PGconn* normal_conn = PQconnectdb(conninfo_.c_str());
     if (PQstatus(normal_conn) != CONNECTION_OK) {
         std::string err = PQerrorMessage(normal_conn);
@@ -104,7 +104,7 @@ void NetworkReceiver::connect() {
     std::cout << "Connected to PostgreSQL for logical replication." << std::endl;
 }
 
-void NetworkReceiver::startLogicalReplication() {
+void WALReceiver::startLogicalReplication() {
     const char* env_slot = std::getenv("PG_SLOT_NAME");
     const char* env_pub = std::getenv("PG_PUBLICATION_NAME");
     
@@ -123,7 +123,7 @@ void NetworkReceiver::startLogicalReplication() {
     std::cout << "Started logical replication stream on slot '" << slot_name << "'." << std::endl;
 }
 
-void NetworkReceiver::receiveLoop() {
+void WALReceiver::receiveLoop() {
     while (keep_running_) {
         char* copy_data = nullptr;
         int ret = PQgetCopyData(conn_, &copy_data, 0); // 0 = block waiting for data
@@ -142,7 +142,7 @@ void NetworkReceiver::receiveLoop() {
     }
 }
 
-void NetworkReceiver::handleCopyData(char* msg, int length) {
+void WALReceiver::handleCopyData(char* msg, int length) {
     if (length == 0) return;
     
     char msg_type = msg[0];
@@ -264,7 +264,7 @@ void NetworkReceiver::handleCopyData(char* msg, int length) {
     }
 }
 
-void NetworkReceiver::sendStandbyStatusUpdate() {
+void WALReceiver::sendStandbyStatusUpdate() {
     char reply[34];
     reply[0] = 'r';
     // For this simple example, we just send all 0s for LSNs and timestamps.
@@ -276,7 +276,7 @@ void NetworkReceiver::sendStandbyStatusUpdate() {
     }
 }
 
-void NetworkReceiver::run() {
+void WALReceiver::run() {
     connect();
     startLogicalReplication();
     receiveLoop();
