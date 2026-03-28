@@ -86,3 +86,11 @@ The `test/` directory contains a high-speed ingestion service (`hn_ingest`) desi
    ```
 
 The daemon will now listen for inserts/updates and automatically flush sequential `.parquet` files into your `data/` directory every 100 rows.
+
+## Troubleshooting
+
+### Editor / IntelliSense Errors (`libpq-fe.h` not found)
+If your editor (VS Code/Antigravity) shows "file not found" errors for `libpq-fe.h` despite being able to build, this is likely an indexing issue:
+1. Ensure `libpq-dev` is installed: `sudo apt install libpq-dev`.
+2. This project includes a `.clangd` and `.vscode/c_cpp_properties.json` configured for Ubuntu 24.04.
+3. If using Clangd, run `Ctrl+Shift+P` -> `Clangd: Restart Language Server` to refresh the index.

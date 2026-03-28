@@ -1,7 +1,7 @@
 #pragma once
 
 #include "BoundedBuffer.hpp"
-#include "NetworkReceiver.hpp" // For WalMessage
+#include "WALReceiver.hpp" // For WalMessage
 #include "TableRegistry.hpp"
 #include "TableWriter.hpp"
 #include <string>
