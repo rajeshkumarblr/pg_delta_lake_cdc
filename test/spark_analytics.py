@@ -35,16 +35,26 @@ def main():
         print("\n--- Delta Table Schema ---")
         df.printSchema()
 
-        # Execute Spark SQL query: Top 5 most discussed articles
-        print("\n--- Top 5 Most Discussed Articles ---")
-        query = """
+        # Deduplicate the CDC log to get the latest state per ID, then find the top 5
+        print("\n--- Top 5 Most Discussed Articles (Deduplicated Latest State) ---")
+        latest_state_query = """
             SELECT id, title, score, descendants, _cdc_op, _cdc_timestamp
-            FROM hn_articles
+            FROM (
+                SELECT *, 
+                       row_number() OVER (PARTITION BY id ORDER BY _cdc_timestamp DESC) as rn
+                FROM hn_articles
+            ) latest_records
+            WHERE rn = 1
             ORDER BY descendants DESC
             LIMIT 5
         """
-        results = spark.sql(query)
+        results = spark.sql(latest_state_query)
         results.show(truncate=False)
+
+        # Also show the summary of Bronze vs Silver for context
+        total_rows = df.count()
+        distinct_rows = results.count()
+        print(f"\nVerification: Processed {total_rows} Bronze events into Silver state.")
 
     except Exception as e:
         print(f"Error loading or querying Delta table: {e}")
