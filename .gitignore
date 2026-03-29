@@ -1,3 +1,10 @@
 build/
 .env
 *.parquet
+data/
+test/data/
+daemon.log
+output.txt
+.cache/
+.venv/
+__pycache__/
