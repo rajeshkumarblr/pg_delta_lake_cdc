@@ -20,8 +20,13 @@ The daemon utilizes a **Producer-Consumer** pattern separated by a thread-safe *
 ### CDC Daemon Internals
 ![Internal Architecture](images/architecture.png)
 
-### End-to-End Stress Test Environment
+### End-to-End Test Architecture
 ![End-to-End Test Architecture](images/overview.png)
+
+## Medallion Architecture Support
+The system is designed to support a **Medallion Architecture** out of the box:
+- **Bronze Layer**: Raw, immutable CDC event stream (Inserts/Updates) written by the C++ daemon into the Delta table.
+- **Silver Layer**: A deduplicated, "latest state" view of the data, reconstructed by downstream consumers (like Spark) using the `_cdc_timestamp` metadata.
 
 For more detailed architecture notes, see [design.md](design.md).
 ## Quick Start with Docker (Recommended)
@@ -31,8 +36,9 @@ The easiest way to see the system in action is using the integrated test infrast
 cd test
 docker-compose up --build
 ```
-Parquet files and Delta logs will be generated in `test/data/stories/`. You can verify the architecture using the included PySpark consumer:
+Parquet files and Delta logs will be generated in `test/data/stories/`. You can verify the **Bronze-to-Silver** reconciliation using the included PySpark consumer:
 ```bash
+# Must be run from project root with .venv activated
 python3 test/spark_analytics.py
 ```
 

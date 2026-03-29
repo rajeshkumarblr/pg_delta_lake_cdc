@@ -1,6 +1,6 @@
 # Architecture & Design: pg_delta_lake_cdc
 
-This document describes the high-level architecture, threading model, and data flow of the PostgreSQL CDC daemon.
+This document describes the high-level architecture, threading model, and the **Medallion Architecture** data flow of the PostgreSQL CDC daemon.
 
 ## High-Level Architecture
 
@@ -62,21 +62,35 @@ sequenceDiagram
     participant PW as ParquetWriter
     participant TW as TableWriter
     participant DL as DeltaLogWriter
+    participant SK as Spark (Consumer)
 
-    PG->>NR: pgoutput Message (Relation R)
-    NR->>NR: Map OID to Table Schema
-    PG->>NR: pgoutput Message (Insert I)
+    PG->>NR: pgoutput Message (Insert/Update)
     NR->>BB: Push WalMessage
     BB->>PW: Pop WalMessage
     PW->>TW: appendRow(payload)
-    TW->>TW: Buffer Arrow Rows (0..99)
     Note over TW: On 100th Row
-    TW->>TW: Inject Metadata (_cdc_op, _cdc_timestamp)
-    TW->>TW: Write Table to Parquet
-    TW->>DL: writeCommit(parquet_metadata)
-    DL->>DL: Generate NDJSON log entry
-    TW-->>TW: Increment commit_version_
+    TW->>TW: Inject (_cdc_op, _cdc_timestamp)
+    TW->>TW: Write Parquet
+    TW->>DL: writeCommit()
+    Note over DL: Bronze Layer (Raw Log)
+    
+    rect rgb(240, 240, 240)
+    Note over SK: Reconcile Silver Layer
+    SK->>SK: Window(id).latest(_cdc_timestamp)
+    end
 ```
+
+## Data Lake Layers
+
+### 1. Bronze Layer (Raw CDC Events)
+The daemon writes every database change as a new row in the Delta table.
+- **Properties**: Immutable, append-only, preserves full history.
+- **Metadata**: Every row includes `_cdc_op` and `_cdc_timestamp` to allow reconstruction of state.
+
+### 2. Silver Layer (Latest State)
+Downstream consumers use Window functions to extract the latest state per ID.
+- **Logic**: `row_number() OVER (PARTITION BY id ORDER BY _cdc_timestamp DESC)`.
+- **Optimization**: Delta Lake's Parquet indexing ensures these queries remain performant even as the Bronze log grows.
 
 ## Configuration (via .env)
 The daemon is highly configurable without re-compilation:
