@@ -3,9 +3,11 @@
 #include <chrono>
 #include <arpa/inet.h>
 #include <cstring>
+#include <filesystem>
+#include "DeltaLogWriter.hpp"
 
 TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir, size_t row_group_size)
-    : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), row_group_size_(row_group_size), current_rows_(0) {
+    : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), row_group_size_(row_group_size), current_rows_(0), commit_version_(0) {
     setupSchemaAndBuilders();
 }
 
@@ -201,8 +203,11 @@ void TableWriter::flushPartition() {
     
     std::shared_ptr<arrow::Table> table = arrow::Table::Make(schema_, arrays);
     
+    std::string table_dir = output_dir_.empty() ? info_.table_name : (output_dir_ + "/" + info_.table_name);
+    std::filesystem::create_directories(table_dir);
+    
     std::string filename = info_.table_name + "_" + std::to_string(++file_counter_) + ".parquet";
-    std::string full_path = output_dir_.empty() ? filename : (output_dir_ + "/" + filename);
+    std::string full_path = table_dir + "/" + filename;
     
     std::shared_ptr<arrow::io::FileOutputStream> outfile;
     PARQUET_ASSIGN_OR_THROW(
@@ -214,6 +219,31 @@ void TableWriter::flushPartition() {
         parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, current_rows_)
     );
     
+    PARQUET_THROW_NOT_OK(outfile->Close());
+    
     std::cout << "Successfully wrote " << filename << std::endl;
+
+    // Delta Protocol Generation
+    std::string table_path = table_dir;
+    size_t file_size = std::filesystem::file_size(full_path);
+    
+    // PoC: Hardcoded Delta Schema for stories (articles)
+    std::string schema_string = "{\"type\":\"struct\",\"fields\":["
+        "{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"title\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"url\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"score\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"by\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"descendants\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"posted_at\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"hn_rank\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"iframe_blocked\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"created_at\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"_cdc_op\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}},"
+        "{\"name\":\"_cdc_timestamp\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}"
+        "]}";
+
+    DeltaLogWriter::writeCommit(table_path, commit_version_++, filename, file_size, schema_string);
+    
     resetBuilders();
 }

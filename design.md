@@ -39,7 +39,12 @@ A dedicated worker thread that:
 Responsible for the final conversion to columnar format:
 -   **Arrow Mapping**: Maps Postgres types (int, float, text, etc.) to Apache Arrow builders.
 -   **CDC Metadata Injection**: Automatically appends `_cdc_op` and `_cdc_timestamp` to every row.
--   **Sequential Flushing**: Once a table hits **100 rows**, it flushes a new Parquet file (e.g., `stories_1.parquet`) to the `data/` directory.
+-   **Delta Protocol Trigger**: Once a table hits **100 rows**, it flushes a Parquet file and triggers the `DeltaLogWriter` to commit the transaction.
+
+### 5. DeltaLogWriter
+A lightweight generator for Delta Lake transaction logs:
+-   **NDJSON Generation**: Produces zero-padded transaction files (e.g., `00000000000000000000.json`).
+-   **Protocol Management**: Automatically creates the `_delta_log` directory and handles `protocol`, `metaData`, and `add` actions.
 
 ## Stress Testing & Verification
 A dedicated `test/` directory provides a high-speed ingestion framework:
@@ -56,6 +61,7 @@ sequenceDiagram
     participant BB as BoundedBuffer
     participant PW as ParquetWriter
     participant TW as TableWriter
+    participant DL as DeltaLogWriter
 
     PG->>NR: pgoutput Message (Relation R)
     NR->>NR: Map OID to Table Schema
@@ -67,7 +73,9 @@ sequenceDiagram
     Note over TW: On 100th Row
     TW->>TW: Inject Metadata (_cdc_op, _cdc_timestamp)
     TW->>TW: Write Table to Parquet
-    TW-->>TW: Increment file_counter_
+    TW->>DL: writeCommit(parquet_metadata)
+    DL->>DL: Generate NDJSON log entry
+    TW-->>TW: Increment commit_version_
 ```
 
 ## Configuration (via .env)

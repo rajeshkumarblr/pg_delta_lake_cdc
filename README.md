@@ -9,9 +9,9 @@ This daemon performs Change Data Capture (CDC) utilizing PostgreSQL's native `pg
 
 - **Dynamic Schema Extraction:** On startup, the daemon queries PostgreSQL's `information_schema` and natively maps PostgreSQL data types to Apache Arrow types (`Int32Builder`, `DoubleBuilder`, `BooleanBuilder`, `StringBuilder`, etc.).
 - **Multi-Table Streaming:** Actively parses `pgoutput` Relation ('R') messages, mapping binary OIDs directly to schema/table names to support infinite concurrent dynamic tables!
-- **Zero-Config Parquet Routing:** Routes all incoming inserts/updates to dedicated `TableWriter` instances per table!
+- **Native Delta Lake Producer:** Implements the Delta Protocol to generate `_delta_log` transaction entries (NDJSON) alongside Parquet files, enabling instant Zero-ETL integration with Databricks/Spark/DuckDB.
 - **CDC Metadata Injection:** Automatically injects `_cdc_op` (INSERT/UPDATE) and `_cdc_timestamp` (event time in ms) into every Parquet row!
-- **Sequential Parquet Naming:** Generates clean, sequential files (e.g., `stories_1.parquet`, `stories_2.parquet`) for easier downstream ingestion.
+- **Sequential Parquet Naming:** Generates clean, sequential files (e.g., `stories_1.parquet`, `stories_2.parquet`) within table-specific Delta directories.
 
 ## Design & Architecture
 
@@ -31,7 +31,10 @@ The easiest way to see the system in action is using the integrated test infrast
 cd test
 docker-compose up --build
 ```
-Parquet files will be generated in `test/data/`.
+Parquet files and Delta logs will be generated in `test/data/stories/`. You can verify the architecture using the included PySpark consumer:
+```bash
+python3 test/spark_analytics.py
+```
 
 ## Manual Compilation
 ### Dependencies

@@ -26,6 +26,7 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
     std::vector<std::shared_ptr<arrow::ArrayBuilder>> builders_;
     size_t current_rows_;
+    int commit_version_;
 
     void setupSchemaAndBuilders();
     void resetBuilders();
