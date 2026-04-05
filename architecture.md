@@ -2,9 +2,17 @@
 
 This document describes the high-level architecture, threading model, and the **Medallion Architecture** data flow of the PostgreSQL CDC pipeline.
 
+> [!TIP]
+> **Mermaid Support in IDE**: If the diagrams below don't render correctly in your IDE, please install the **"Markdown Preview Mermaid Support"** extension (e.g., from Matt Bierner) to enable native rendering of the Mermaid blocks.
+
 ## End-to-End Data Flow (Medallion Architecture)
 
 The pipeline captures real-time changes from a source operational database and materializes them into a refined "Silver" Delta table for analytical use.
+
+![Medallion Architecture](images/medallion_architecture.png)
+
+<details>
+<summary>View Mermaid Source</summary>
 
 ```mermaid
 graph TD
@@ -26,6 +34,7 @@ graph TD
         MD -->|ACID Merge| SL[(Silver Delta Table)]
     end
 ```
+</details>
 
 | Layer | Type | Responsibility |
 | :--- | :--- | :--- |
@@ -37,6 +46,11 @@ graph TD
 The system is designed as a producer-consumer architecture using a thread-safe bounded buffer for decoupled processing.
 
 ### Class Hierarchy & Organization
+
+![CDC Daemon Architecture](images/cdc_daemon_architecture.png)
+
+<details>
+<summary>View Mermaid Source</summary>
 
 ```mermaid
 classDiagram
@@ -116,12 +130,16 @@ classDiagram
     TableWriter --> TableRegistry : uses metadata
     TableWriter ..> DeltaLogWriter : uses for commits
 ```
+</details>
 
 ## Detailed Data Flow (Sequence Diagram)
 
 ### I. WAL Capture & Bronze Writing (C++ Daemon)
 
 This diagram illustrates the lifecycle of a WAL event from PostgreSQL to a raw Delta log.
+
+<details>
+<summary>View Mermaid Source</summary>
 
 ```mermaid
 sequenceDiagram
@@ -156,10 +174,14 @@ sequenceDiagram
         end
     end
 ```
+</details>
 
 ### II. Silver Materialization (Spark Incremental Merge)
 
 Illustrates how the downstream Spark process reconciles the raw Bronze log into a deduplicated Silver state.
+
+<details>
+<summary>View Mermaid Source</summary>
 
 ```mermaid
 sequenceDiagram
@@ -175,6 +197,7 @@ sequenceDiagram
     SM->>SL: MERGE (Update where Matched, Insert where Not)
     Note over SL: ACID Materialized State
 ```
+</details>
 
 ## Component Details
 
@@ -209,6 +232,8 @@ A static utility class that implements the **Delta Lake Transaction Log Protocol
 ## LSN Acknowledgment Flow
 
 Correct LSN handling is critical for preventing data loss and managing database storage. The system implements a **Flush-then-Confirm** strategy:
+
+![LSN Flow](images/lsn_flow.png)
 
 1.  **Extraction**: The `WALReceiver` captures the LSN from the replication stream and tags each message.
 2.  **Buffering**: The LSN travels with the data through the `BoundedBuffer`.
