@@ -3,13 +3,13 @@
 This document describes the high-level architecture, threading model, and the **Medallion Architecture** data flow of the PostgreSQL CDC pipeline.
 
 > [!TIP]
-> **Mermaid Support in IDE**: If the diagrams below don't render correctly in your IDE, please install the **"Markdown Preview Mermaid Support"** extension (e.g., from Matt Bierner) to enable native rendering of the Mermaid blocks.
+> **Mermaid Support in IDE**: The diagrams below are pre-rendered for maximum compatibility. If you wish to edit them, please modify the Mermaid blocks in the source. To enable native rendering in VS Code, install the **"Markdown Preview Mermaid Support"** extension.
 
 ## End-to-End Data Flow (Medallion Architecture)
 
 The pipeline captures real-time changes from a source operational database and materializes them into a refined "Silver" Delta table for analytical use.
 
-![Medallion Architecture](images/medallion_architecture.png)
+![Medallion Architecture](images/mermaid_medallion.png)
 
 <details>
 <summary>View Mermaid Source</summary>
@@ -47,7 +47,7 @@ The system is designed as a producer-consumer architecture using a thread-safe b
 
 ### Class Hierarchy & Organization
 
-![CDC Daemon Architecture](images/cdc_daemon_architecture.png)
+![CDC Daemon Architecture](images/mermaid_class.png)
 
 <details>
 <summary>View Mermaid Source</summary>
@@ -138,6 +138,8 @@ classDiagram
 
 This diagram illustrates the lifecycle of a WAL event from PostgreSQL to a raw Delta log.
 
+![WAL Capture Flow](images/mermaid_wal.png)
+
 <details>
 <summary>View Mermaid Source</summary>
 
@@ -179,6 +181,8 @@ sequenceDiagram
 ### II. Silver Materialization (Spark Incremental Merge)
 
 Illustrates how the downstream Spark process reconciles the raw Bronze log into a deduplicated Silver state.
+
+![Silver Materialization Flow](images/mermaid_spark.png)
 
 <details>
 <summary>View Mermaid Source</summary>
