@@ -235,10 +235,10 @@ void TableWriter::flushPartition() {
         "{\"name\":\"score\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},"
         "{\"name\":\"by\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},"
         "{\"name\":\"descendants\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},"
-        "{\"name\":\"posted_at\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"posted_at\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},"
         "{\"name\":\"hn_rank\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},"
         "{\"name\":\"iframe_blocked\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}},"
-        "{\"name\":\"created_at\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},"
+        "{\"name\":\"created_at\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},"
         "{\"name\":\"_cdc_op\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}},"
         "{\"name\":\"_cdc_timestamp\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}"
         "]}";
