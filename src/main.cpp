@@ -71,14 +71,15 @@ int main(int argc, char* argv[]) {
 
     try {
         auto registry = std::make_shared<TableRegistry>();
+        auto committed_lsn = std::make_shared<std::atomic<uint64_t>>(0);
         BoundedBuffer<WalMessage> buffer(10000);
 
-        ParquetWriter writer(buffer, registry, output_dir, 100);
+        ParquetWriter writer(buffer, registry, output_dir, committed_lsn, 100);
         
         g_writer = &writer;
         writer.start();
 
-        WALReceiver receiver(conninfo, buffer, registry);
+        WALReceiver receiver(conninfo, buffer, registry, committed_lsn);
         
         g_receiver = &receiver;
         receiver.run(); 

@@ -19,15 +19,18 @@ classDiagram
         -PGconn* conn
         -BoundedBuffer& buffer
         -TableRegistryPtr registry
+        -atomic~uint64_t~* committed_lsn
         +run()
         +stop()
         -receiveLoop()
         -handleCopyData()
+        -sendStandbyStatusUpdate(lsn)
     }
 
     class ParquetWriter {
         -BoundedBuffer& buffer
         -TableRegistryPtr registry
+        -atomic~uint64_t~* committed_lsn
         -unordered_map<uint32_t, TableWriterPtr> writers
         +start()
         +stop()
@@ -37,9 +40,17 @@ classDiagram
 
     class TableWriter {
         -TableInfo info
+        -atomic~uint64_t~* committed_lsn
+        -uint64_t latest_lsn
         -vector<ArrowBuilderPtr> builders
         +appendRow()
         +flushPartition()
+    }
+
+    class WalMessage {
+        +uint32_t relation_id
+        +uint64_t lsn
+        +vector~char~ payload
     }
 
     class DeltaLogWriter {
@@ -97,29 +108,27 @@ sequenceDiagram
     
     loop CDC Loop
         PG->>WR: CopyData (WAL Message)
-        WR->>WR: Parse Message (Relation ID, Tuple)
+        WR->>WR: Extract LSN & Payload
         WR->>TR: Lookup Relation Metadata
         TR-->>WR: TableInfo
-        WR->>BB: push(WalMessage)
+        WR->>BB: push(WalMessage{lsn, ...})
         
         BB->>PW: pop()
-        PW->>TR: getTableByRelationId(rel_id)
-        TR-->>PW: TableInfo
+        PW->>TW: appendRow(tuple, lsn)
         
-        alt TableWriter exists?
-            PW->>TW: appendRow(tuple)
-        else Create New Writer
-            PW->>TW: Instantiate TableWriter
-            PW->>TW: appendRow(tuple)
-        end
-        
-        Note over TW: Buffers rows in memory (Apache Arrow)
+        Note over TW: Buffers rows in memory
         
         opt row_group_size reached
             TW->>TW: flushPartition()
             Note right of TW: Writes Parquet file
             TW->>DL: writeCommit()
-            Note right of DL: Generates Delta Lake JSON Log
+            TW->>TW: Update committed_lsn (Atomic)
+        end
+        
+        opt Periodic Heartbeat (5s)
+            WR-->>WR: Read committed_lsn
+            WR->>PG: StandbyStatusUpdate(lsn)
+            Note left of PG: Advances Replication Slot
         end
     end
 ```
@@ -128,7 +137,7 @@ sequenceDiagram
 
 | Component | Responsibility |
 | :--- | :--- |
-| **WAL Receiver** | Manages PostgreSQL connection, handles logical replication protocol, and enqueues raw WAL messages. |
+| **WAL Receiver** | Manages PostgreSQL connection, handles logical replication protocol, extracts LSNs, and sends feedback updates to PostgreSQL to advance the replication slot. |
 | **Bounded Buffer** | Thread-safe queue providing backpressure and decoupling the network-bound receiver from the disk-bound writer. |
 | **Parquet Writer** | Background worker that dispatches messages to table-specific writers and manages the `TableWriter` lifecycle. |
 | **Table Writer** | Encapsulates Apache Arrow builders to construct schemas and write Parquet files. |

@@ -7,13 +7,16 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <atomic>
 
 class TableWriter {
 public:
-    TableWriter(const TableInfo& info, const std::string& output_dir, size_t row_group_size = 100);
+    TableWriter(const TableInfo& info, const std::string& output_dir, 
+                std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
+                size_t row_group_size = 100);
     ~TableWriter();
 
-    void appendRow(const char* tuple_data, size_t length);
+    void appendRow(const char* tuple_data, size_t length, uint64_t lsn);
     void flushPartition();
 
 private:
@@ -27,6 +30,8 @@ private:
     std::vector<std::shared_ptr<arrow::ArrayBuilder>> builders_;
     size_t current_rows_;
     int commit_version_;
+    uint64_t latest_lsn_;
+    std::shared_ptr<std::atomic<uint64_t>> committed_lsn_;
 
     void setupSchemaAndBuilders();
     void resetBuilders();

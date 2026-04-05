@@ -73,14 +73,16 @@ private:
     static std::string escapeJson(const std::string& s) {
         std::ostringstream oss;
         for (auto c : s) {
-            if (c == '"') oss << "\\\"";
-            else if (c == '\\') oss << "\\\\";
-            else if (c == '\b') oss << "\\b";
-            else if (c == '\f') oss << "\\f";
-            else if (c == '\n') oss << "\\n";
-            else if (c == '\r') oss << "\\r";
-            else if (c == '\t') oss << "\\t";
-            else oss << c;
+            switch (c) {
+                case '"': oss << "\\\""; break;
+                case '\\': oss << "\\\\"; break;
+                case '\b': oss << "\\b"; break;
+                case '\f': oss << "\\f"; break;
+                case '\n': oss << "\\n"; break;
+                case '\r': oss << "\\r"; break;
+                case '\t': oss << "\\t"; break;
+                default: oss << c; break;
+            }
         }
         return oss.str();
     }

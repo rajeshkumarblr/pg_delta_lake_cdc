@@ -3,12 +3,14 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <endian.h>
 
 WALReceiver::WALReceiver(const std::string &conninfo,
                          BoundedBuffer<WalMessage> &buffer,
-                         std::shared_ptr<TableRegistry> registry)
+                         std::shared_ptr<TableRegistry> registry,
+                         std::shared_ptr<std::atomic<uint64_t>> committed_lsn)
     : conninfo_(conninfo), buffer_(buffer), registry_(std::move(registry)),
-      conn_(nullptr), keep_running_(true) {}
+      committed_lsn_(committed_lsn), conn_(nullptr), keep_running_(true) {}
 
 WALReceiver::~WALReceiver() {
   stop();
@@ -18,6 +20,46 @@ WALReceiver::~WALReceiver() {
 }
 
 void WALReceiver::stop() { keep_running_ = false; }
+
+void WALReceiver::run() {
+  connect();
+  startLogicalReplication();
+  receiveLoop();
+}
+
+void WALReceiver::connect() {
+  PGconn *normal_conn = PQconnectdb(conninfo_.c_str());
+  if (PQstatus(normal_conn) != CONNECTION_OK) {
+    std::string err = PQerrorMessage(normal_conn);
+    PQfinish(normal_conn);
+    throw std::runtime_error("Standard database connection failed: " + err);
+  }
+  fetchSchemas(normal_conn);
+  PQfinish(normal_conn);
+
+  std::string rep_conninfo = conninfo_;
+
+  if (rep_conninfo.find("postgres://") == 0 ||
+      rep_conninfo.find("postgresql://") == 0) {
+    if (rep_conninfo.find('?') == std::string::npos) {
+      rep_conninfo += "?replication=database";
+    } else {
+      rep_conninfo += "&replication=database";
+    }
+  } else {
+    rep_conninfo += " replication=database";
+  }
+
+  conn_ = PQconnectdb(rep_conninfo.c_str());
+
+  if (PQstatus(conn_) != CONNECTION_OK) {
+    std::string err = PQerrorMessage(conn_);
+    PQfinish(conn_);
+    conn_ = nullptr;
+    throw std::runtime_error("Connection to database failed: " + err);
+  }
+  std::cout << "Connected to PostgreSQL for logical replication." << std::endl;
+}
 
 void WALReceiver::fetchSchemas(PGconn *normal_conn) {
   std::cout << "Fetching schema definitions from PostgreSQL..." << std::endl;
@@ -72,40 +114,6 @@ void WALReceiver::fetchSchemas(PGconn *normal_conn) {
             << std::endl;
 }
 
-void WALReceiver::connect() {
-  PGconn *normal_conn = PQconnectdb(conninfo_.c_str());
-  if (PQstatus(normal_conn) != CONNECTION_OK) {
-    std::string err = PQerrorMessage(normal_conn);
-    PQfinish(normal_conn);
-    throw std::runtime_error("Standard database connection failed: " + err);
-  }
-  fetchSchemas(normal_conn);
-  PQfinish(normal_conn);
-
-  std::string rep_conninfo = conninfo_;
-
-  if (rep_conninfo.find("postgres://") == 0 ||
-      rep_conninfo.find("postgresql://") == 0) {
-    if (rep_conninfo.find('?') == std::string::npos) {
-      rep_conninfo += "?replication=database";
-    } else {
-      rep_conninfo += "&replication=database";
-    }
-  } else {
-    rep_conninfo += " replication=database";
-  }
-
-  conn_ = PQconnectdb(rep_conninfo.c_str());
-
-  if (PQstatus(conn_) != CONNECTION_OK) {
-    std::string err = PQerrorMessage(conn_);
-    PQfinish(conn_);
-    conn_ = nullptr;
-    throw std::runtime_error("Connection to database failed: " + err);
-  }
-  std::cout << "Connected to PostgreSQL for logical replication." << std::endl;
-}
-
 void WALReceiver::startLogicalReplication() {
   const char *env_slot = std::getenv("PG_SLOT_NAME");
   const char *env_pub = std::getenv("PG_PUBLICATION_NAME");
@@ -133,25 +141,42 @@ void WALReceiver::receiveLoop() {
     char *copy_data = nullptr;
     int ret = PQgetCopyData(conn_, &copy_data, 0); // 0 = block waiting for data
 
-    if (ret > 0) {
-      handleCopyData(copy_data, ret);
-      PQfreemem(copy_data);
-    } else if (ret == 0) {
+    static uint64_t last_status_update_time = 0;
+    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+
+    switch (ret) {
+    case 0: // No data currently available
+      // Periodically send status update even if no data
+      if (now - last_status_update_time > 5) {
+        sendStandbyStatusUpdate(committed_lsn_->load());
+        last_status_update_time = now;
+      }
       continue;
-    } else if (ret == -1) {
+    case -1: // End of stream
       std::cout << "End of COPY data stream from PostgreSQL." << std::endl;
-      // If Postgres killed the stream, the exact error is waiting in the Result
-      // buffer!
-      PGresult *res = PQgetResult(conn_);
-      if (res) {
+      if (PGresult *res = PQgetResult(conn_)) {
         std::cerr << "Postgres FATAL Error: " << PQerrorMessage(conn_)
                   << std::endl;
         PQclear(res);
       }
-      break;
-    } else if (ret == -2) {
+      return; // Exit receiveLoop
+    case -2:  // Error occurred
       throw std::runtime_error(std::string("Error during PQgetCopyData: ") +
                                PQerrorMessage(conn_));
+    default:
+      if (ret > 0) {
+        handleCopyData(copy_data, ret);
+        PQfreemem(copy_data);
+
+        // Also update after data processing if enough time passed
+        if (now - last_status_update_time > 5) {
+          sendStandbyStatusUpdate(committed_lsn_->load());
+          last_status_update_time = now;
+        }
+      }
+      break;
     }
   }
 }
@@ -160,8 +185,9 @@ void WALReceiver::handleCopyData(char *msg, int length) {
   if (length == 0)
     return;
 
-  char msg_type = msg[0];
-  if (msg_type == 'w') { // WAL data
+  const char msg_type = msg[0];
+  switch (msg_type) {
+  case 'w': { // WAL data
     if (length < 25)
       return;
 
@@ -173,142 +199,187 @@ void WALReceiver::handleCopyData(char *msg, int length) {
 
     int wal_payload_len = length - 25;
     if (wal_payload_len > 0) {
+      uint64_t lsn_n;
+      std::memcpy(&lsn_n, msg + 1, 8);
+      uint64_t lsn = be64toh(lsn_n);
+
       char *payload_start = msg + 25;
       char pgoutput_msg_type = payload_start[0];
 
-      if (pgoutput_msg_type == 'R') {
-        size_t offset = 1;
-        if (offset + 4 > wal_payload_len)
-          return;
+      switch (pgoutput_msg_type) {
+      case 'R':
+        handleRelationMessage(payload_start, wal_payload_len);
+        break;
+      case 'I':
+      case 'U':
+      case 'D':
+        handleDataMessage(payload_start, wal_payload_len, lsn);
+        break;
+      default:
+        break;
+      }
+    }
+    break;
+  }
+  case 'k': // Keepalive
+    handleKeepAliveMessage(msg, length);
+    break;
+  default:
+    break;
+  }
+}
 
-        uint32_t rel_id_n;
-        std::memcpy(&rel_id_n, payload_start + offset, 4);
-        uint32_t rel_id = ntohl(rel_id_n);
-        offset += 4;
+void WALReceiver::handleRelationMessage(char *payload, int length) {
+  size_t offset = 1;
+  if (offset + 4 > length)
+    return;
 
-        std::string schema_name;
-        while (offset < wal_payload_len && payload_start[offset] != '\0') {
-          schema_name += payload_start[offset++];
-        }
-        offset++;
+  uint32_t rel_id_n;
+  std::memcpy(&rel_id_n, payload + offset, 4);
+  uint32_t rel_id = ntohl(rel_id_n);
+  offset += 4;
 
-        std::string table_name;
-        while (offset < wal_payload_len && payload_start[offset] != '\0') {
-          table_name += payload_start[offset++];
-        }
-        offset++;
+  std::string schema_name;
+  while (offset < length && payload[offset] != '\0') {
+    schema_name += payload[offset++];
+  }
+  offset++;
 
-        // Read replica identity (1 byte)
-        if (offset + 1 > wal_payload_len)
-          return;
-        offset++;
+  std::string table_name;
+  while (offset < length && payload[offset] != '\0') {
+    table_name += payload[offset++];
+  }
+  offset++;
 
-        // Read num_columns (2 bytes)
-        if (offset + 2 > wal_payload_len)
-          return;
-        uint16_t num_columns_n;
-        std::memcpy(&num_columns_n, payload_start + offset, 2);
-        uint16_t num_columns = ntohs(num_columns_n);
-        offset += 2;
+  // Read replica identity (1 byte)
+  if (offset + 1 > length)
+    return;
+  offset++;
 
-        TableInfo fetched_info;
-        bool has_catalog =
-            registry_->getTable(schema_name, table_name, fetched_info);
+  // Read num_columns (2 bytes)
+  if (offset + 2 > length)
+    return;
+  uint16_t num_columns_n;
+  std::memcpy(&num_columns_n, payload + offset, 2);
+  uint16_t num_columns = ntohs(num_columns_n);
+  offset += 2;
 
-        TableInfo stream_info;
-        stream_info.schema = schema_name;
-        stream_info.table_name = table_name;
+  TableInfo fetched_info;
+  bool has_catalog = registry_->getTable(schema_name, table_name, fetched_info);
 
-        for (uint16_t i = 0; i < num_columns; ++i) {
-          if (offset + 1 > wal_payload_len)
-            break;
-          offset += 1; // flags
+  TableInfo stream_info;
+  stream_info.schema = schema_name;
+  stream_info.table_name = table_name;
 
-          std::string col_name;
-          while (offset < wal_payload_len && payload_start[offset] != '\0') {
-            col_name += payload_start[offset++];
-          }
-          offset++;
+  parseRelationColumns(payload, length, offset, num_columns, stream_info,
+                       fetched_info, has_catalog);
 
-          if (offset + 8 > wal_payload_len)
-            break;
-          offset += 8; // skip DataType OID (4 bytes) and atttypmod (4 bytes)
+  std::cout << "Mapped Relation ID " << rel_id << " to " << schema_name << "."
+            << table_name << " (" << stream_info.columns.size()
+            << " streaming replica columns)" << std::endl;
 
-          std::string mapped_type = "text";
-          bool is_nullable = true;
+  registry_->mapRelationId(rel_id, stream_info);
+}
 
-          if (has_catalog) {
-            for (const auto &fc : fetched_info.columns) {
-              if (fc.name == col_name) {
-                mapped_type = fc.data_type;
-                is_nullable = fc.is_nullable;
-                break;
-              }
-            }
-          }
+void WALReceiver::parseRelationColumns(const char *payload, int length,
+                                       size_t &offset, uint16_t num_columns,
+                                       TableInfo &info,
+                                       const TableInfo &fetched_info,
+                                       bool has_catalog) {
+  for (uint16_t i = 0; i < num_columns; ++i) {
+    if (offset + 1 > length)
+      break;
+    offset += 1; // flags
 
-          ColumnInfo col;
-          col.name = col_name;
-          col.data_type = mapped_type;
-          col.is_nullable = is_nullable;
-          stream_info.columns.push_back(col);
-        }
+    std::string col_name;
+    while (offset < length && payload[offset] != '\0') {
+      col_name += payload[offset++];
+    }
+    offset++;
 
-        std::cout << "Mapped Relation ID " << rel_id << " to " << schema_name
-                  << "." << table_name << " (" << stream_info.columns.size()
-                  << " streaming replica columns)" << std::endl;
+    if (offset + 8 > length)
+      break;
+    offset += 8; // skip DataType OID (4 bytes) and atttypmod (4 bytes)
 
-        registry_->mapRelationId(rel_id, stream_info);
+    std::string mapped_type = "text";
+    bool is_nullable = true;
 
-      } else if (pgoutput_msg_type == 'I' || pgoutput_msg_type == 'U' ||
-                 pgoutput_msg_type == 'D') {
-        if (wal_payload_len < 5)
-          return;
-
-        uint32_t rel_id_n;
-        std::memcpy(&rel_id_n, payload_start + 1, 4);
-        uint32_t relation_id = ntohl(rel_id_n);
-
-        // Check if this relation_id belongs to the target schema (e.g. public,
-        // or mapped schema)
-        TableInfo info;
-        if (registry_->getTableByRelationId(relation_id, info)) {
-          WalMessage wal_msg;
-          wal_msg.relation_id = relation_id;
-          wal_msg.payload.assign(payload_start,
-                                 payload_start + wal_payload_len);
-          buffer_.push(std::move(wal_msg));
+    if (has_catalog) {
+      for (const auto &fc : fetched_info.columns) {
+        if (fc.name == col_name) {
+          mapped_type = fc.data_type;
+          is_nullable = fc.is_nullable;
+          break;
         }
       }
     }
-  } else if (msg_type == 'k') { // Keepalive
-    // std::cout << "Received Keepalive message from PostgreSQL." << std::endl;
-    if (length >= 18) {
-      char reply_requested = msg[17];
-      if (reply_requested) {
-        // std::cout << "PostgreSQL requested an immediate reply to the
-        // Keepalive. Sending status update..." << std::endl;
-        sendStandbyStatusUpdate();
-      }
+
+    ColumnInfo col;
+    col.name = col_name;
+    col.data_type = mapped_type;
+    col.is_nullable = is_nullable;
+    info.columns.push_back(col);
+  }
+}
+
+void WALReceiver::handleDataMessage(char *payload, int length, uint64_t lsn) {
+  if (length < 5)
+    return;
+
+  uint32_t rel_id_n;
+  std::memcpy(&rel_id_n, payload + 1, 4);
+  uint32_t relation_id = ntohl(rel_id_n);
+
+  TableInfo info;
+  if (registry_->getTableByRelationId(relation_id, info)) {
+    WalMessage wal_msg;
+    wal_msg.relation_id = relation_id;
+    wal_msg.lsn = lsn;
+    wal_msg.payload.assign(payload, payload + length);
+    buffer_.push(std::move(wal_msg));
+  }
+}
+
+void WALReceiver::handleKeepAliveMessage(char *msg, int length) {
+  if (length >= 18) {
+    char reply_requested = msg[17];
+    if (reply_requested) {
+      sendStandbyStatusUpdate(committed_lsn_->load());
     }
   }
 }
 
-void WALReceiver::sendStandbyStatusUpdate() {
+void WALReceiver::sendStandbyStatusUpdate(uint64_t lsn) {
+  if (lsn == 0)
+    return;
+
+  // std::cout << "Sending status update to PostgreSQL with LSN: " << lsn <<
+  // std::endl;
+
   char reply[34];
   reply[0] = 'r';
-  // For this simple example, we just send all 0s for LSNs and timestamps.
-  // In a production app, we would track and send the actual applied LSNs.
-  std::memset(reply + 1, 0, 33);
+
+  uint64_t lsn_n = htobe64(lsn);
+
+  // Receive LSN
+  std::memcpy(reply + 1, &lsn_n, 8);
+  // Flush LSN
+  std::memcpy(reply + 9, &lsn_n, 8);
+  // Apply LSN
+  std::memcpy(reply + 17, &lsn_n, 8);
+
+  // Timestamp (8 bytes)
+  uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+  uint64_t now_n = htobe64(now_us);
+  std::memcpy(reply + 25, &now_n, 8);
+
+  // Reply requested (1 byte)
+  reply[33] = 0;
 
   if (PQputCopyData(conn_, reply, 34) <= 0 || PQflush(conn_) != 0) {
     std::cerr << "Could not send standby status update: "
               << PQerrorMessage(conn_) << std::endl;
   }
-}
-
-void WALReceiver::run() {
-  connect();
-  startLogicalReplication();
-  receiveLoop();
 }

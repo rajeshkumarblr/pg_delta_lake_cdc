@@ -12,7 +12,9 @@
 
 class ParquetWriter {
 public:
-    ParquetWriter(BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry, const std::string& output_dir, size_t row_group_size = 100);
+    ParquetWriter(BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry, 
+                  const std::string& output_dir, std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
+                  size_t row_group_size = 100);
     ~ParquetWriter();
 
     void start();
@@ -25,6 +27,7 @@ private:
     size_t row_group_size_;
     std::atomic<bool> keep_running_;
     std::thread worker_thread_;
+    std::shared_ptr<std::atomic<uint64_t>> committed_lsn_;
     std::unordered_map<uint32_t, std::unique_ptr<TableWriter>> writers_;
 
     void run();

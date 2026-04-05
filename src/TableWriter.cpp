@@ -6,8 +6,11 @@
 #include <filesystem>
 #include "DeltaLogWriter.hpp"
 
-TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir, size_t row_group_size)
-    : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), row_group_size_(row_group_size), current_rows_(0), commit_version_(0) {
+TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir, 
+                         std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
+                         size_t row_group_size)
+    : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), 
+      row_group_size_(row_group_size), current_rows_(0), commit_version_(0), latest_lsn_(0), committed_lsn_(committed_lsn) {
     setupSchemaAndBuilders();
 }
 
@@ -82,29 +85,44 @@ void TableWriter::resetBuilders() {
     update_count_ = 0;
 }
 
-void TableWriter::appendRow(const char* data, size_t length) {
+void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn) {
+    if (lsn > latest_lsn_) {
+        latest_lsn_ = lsn;
+    }
     if (length == 0) return;
     
-    char msg_type = data[0];
-    if (msg_type != 'I' && msg_type != 'U' && msg_type != 'D') return;
+    const char msg_type = data[0];
+    switch (msg_type) {
+        case 'I':
+        case 'U':
+        case 'D':
+            break;
+        default:
+            return;
+    }
     
     size_t offset = 1; // Skip message type 'I', 'U', 'D'
     offset += 4; // Skip relation_id
     
-    if (msg_type == 'D') return; // For CDC, maybe ignore deletes for now or handle them 
-    if (msg_type == 'U') {
-        // Updates might have 'K' (key) or 'O' (old) tuple before 'N'.
-        // Let's just scan for 'N' to keep it robust
-        while (offset < length && data[offset] != 'N') {
-            offset++;
+    switch (msg_type) {
+        case 'D': return; // For CDC, maybe ignore deletes for now or handle them
+        case 'U': {
+            // Updates might have 'K' (key) or 'O' (old) tuple before 'N'.
+            // Let's just scan for 'N' to keep it robust
+            while (offset < length && data[offset] != 'N') {
+                offset++;
+            }
+            break;
         }
+        default:
+            break;
     }
-    
+
     if (offset + 1 > length) return;
-    char n_type = data[offset++];
+    const char n_type = data[offset++];
     if (n_type != 'N') {
         std::cerr << "TableWriter: Failed to find 'N' tuple in message. Found '" << n_type << "' instead." << std::endl;
-        return; 
+        return;
     }
     
     if (offset + 2 > length) return;
@@ -119,46 +137,54 @@ void TableWriter::appendRow(const char* data, size_t length) {
         char kind = data[offset++];
         auto& builder = builders_[col];
         
-        if (kind == 'n') { // null
-            if (!builder->AppendNull().ok()) all_ok = false;
-        } else if (kind == 'u') { // unchanged toast
-            if (!builder->AppendNull().ok()) all_ok = false; // we just append null for unchanged toast in this simple cdc
-        } else if (kind == 't' || kind == 'b') { // text or binary
-            if (offset + 4 > length) return;
-            
-            uint32_t col_len_n;
-            std::memcpy(&col_len_n, data + offset, 4);
-            uint32_t col_len = ntohl(col_len_n);
-            offset += 4;
-            
-            if (offset + col_len > length) return;
-            std::string col_val(data + offset, col_len);
-            offset += col_len;
-            
-            arrow::Status status;
-            const std::string& dt = info_.columns[col].data_type;
-            
-            if (dt == "integer" || dt == "int4" || dt == "serial") {
-                auto* b = static_cast<arrow::Int32Builder*>(builder.get());
-                try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
-                auto* b = static_cast<arrow::Int64Builder*>(builder.get());
-                try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "real" || dt == "float4") {
-                auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
-                try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
-                auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
-                try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "boolean" || dt == "bool") {
-                auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
-                bool val = (col_val == "t" || col_val == "true" || col_val == "1");
-                status = b->Append(val);
-            } else {
-                auto* b = static_cast<arrow::StringBuilder*>(builder.get());
-                status = b->Append(col_val);
+        switch (kind) {
+            case 'n': // null
+                if (!builder->AppendNull().ok()) all_ok = false;
+                break;
+            case 'u': // unchanged toast
+                if (!builder->AppendNull().ok()) all_ok = false; // we just append null for unchanged toast in this simple cdc
+                break;
+            case 't': // text
+            case 'b': { // binary
+                if (offset + 4 > length) return;
+
+                uint32_t col_len_n;
+                std::memcpy(&col_len_n, data + offset, 4);
+                uint32_t col_len = ntohl(col_len_n);
+                offset += 4;
+
+                if (offset + col_len > length) return;
+                std::string col_val(data + offset, col_len);
+                offset += col_len;
+
+                arrow::Status status;
+                const std::string& dt = info_.columns[col].data_type;
+
+                if (dt == "integer" || dt == "int4" || dt == "serial") {
+                    auto* b = static_cast<arrow::Int32Builder*>(builder.get());
+                    try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
+                } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
+                    auto* b = static_cast<arrow::Int64Builder*>(builder.get());
+                    try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
+                } else if (dt == "real" || dt == "float4") {
+                    auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
+                    try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
+                } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
+                    auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
+                    try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
+                } else if (dt == "boolean" || dt == "bool") {
+                    auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
+                    bool val = (col_val == "t" || col_val == "true" || col_val == "1");
+                    status = b->Append(val);
+                } else {
+                    auto* b = static_cast<arrow::StringBuilder*>(builder.get());
+                    status = b->Append(col_val);
+                }
+                if (!status.ok()) all_ok = false;
+                break;
             }
-            if (!status.ok()) all_ok = false;
+            default:
+                break;
         }
     }
     
@@ -245,5 +271,10 @@ void TableWriter::flushPartition() {
 
     DeltaLogWriter::writeCommit(table_path, commit_version_++, filename, file_size, schema_string);
     
+    if (committed_lsn_) {
+        committed_lsn_->store(latest_lsn_);
+        std::cout << "TableWriter [" << info_.table_name << "]: Advanced committed LSN to " << latest_lsn_ << std::endl;
+    }
+
     resetBuilders();
 }
