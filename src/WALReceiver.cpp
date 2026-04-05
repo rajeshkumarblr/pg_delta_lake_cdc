@@ -268,6 +268,7 @@ void WALReceiver::handleRelationMessage(char *payload, int length) {
   bool has_catalog = registry_->getTable(schema_name, table_name, fetched_info);
 
   TableInfo stream_info;
+  stream_info.rel_id = rel_id;
   stream_info.schema = schema_name;
   stream_info.table_name = table_name;
 

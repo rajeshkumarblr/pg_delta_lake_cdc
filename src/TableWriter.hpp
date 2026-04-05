@@ -7,7 +7,9 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <atomic>
+#include "BoundedBuffer.hpp"
+#include "WALReceiver.hpp" // For WalMessage
+#include <thread>
 
 class TableWriter {
 public:
@@ -18,6 +20,12 @@ public:
 
     void appendRow(const char* tuple_data, size_t length, uint64_t lsn);
     void flushPartition();
+    void start();
+    void stop();
+
+    // Get the oldest LSN currently in this writer's pipeline (queue or being processed)
+    uint64_t getOldestPendingLSN() const;
+    uint64_t getLastCommittedLSN() const { return committed_lsn_val_.load(); }
 
 private:
     TableInfo info_;
@@ -31,8 +39,18 @@ private:
     size_t current_rows_;
     int commit_version_;
     uint64_t latest_lsn_;
-    std::shared_ptr<std::atomic<uint64_t>> committed_lsn_;
+    std::shared_ptr<std::atomic<uint64_t>> global_committed_lsn_;
+    
+    // Threading and Queueing
+    BoundedBuffer<WalMessage> queue_;
+    std::thread worker_thread_;
+    std::atomic<bool> keep_running_;
+    std::atomic<uint64_t> committed_lsn_val_;
+    mutable std::mutex lsn_mtx_;
+    uint64_t oldest_lsn_in_queue_;
 
     void setupSchemaAndBuilders();
     void resetBuilders();
+    void run();
+    void processInternal(const WalMessage& msg);
 };

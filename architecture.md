@@ -24,7 +24,8 @@ graph TD
         PG -->|pgoutput| WR[WALReceiver]
         WR -->|WAL Messages| BB((Bounded Buffer))
         BB -->|Buffered Pop| PW[ParquetWriter]
-        PW -->|Table Routing| TW[TableWriter]
+        PW -->|Dispatch| TQ((Per-Table Queues))
+        TQ -->|Async Process| TW[TableWriter Threads]
         TW -->|100-row Batches| BR[(Bronze Delta Table)]
     end
 
@@ -84,11 +85,16 @@ classDiagram
 
     class TableWriter {
         -TableInfo info
-        -atomic~uint64_t~* committed_lsn
+        -BoundedBuffer~WalMessage~ queue
+        -thread worker_thread
+        -atomic~uint64_t~ committed_lsn_val
         -uint64_t latest_lsn
-        -vector<ArrowBuilderPtr> builders
+        +start()
+        +stop()
         +appendRow()
-        +flushPartition()
+        +getOldestPendingLSN()
+        -run()
+        -processInternal()
     }
 
     class WalMessage {
@@ -154,25 +160,27 @@ sequenceDiagram
 
     loop CDC Loop
         PG->>WR: CopyData (WAL Message)
-        WR->>WR: Extract LSN & Payload
-        WR->>BB: push(WalMessage{lsn, ...})
+        WR->>BB: push(WalMessage)
         
         BB->>PW: pop()
-        PW->>TW: appendRow(tuple, lsn)
+        PW->>TW: dispatch to queue
         
-        Note over TW: Buffers rows in memory
+        Note over TW: Async Processing Thread
+        TW->>TW: processInternal()
         
         opt row_group_size reached
             TW->>TW: flushPartition()
-            Note right of TW: Writes Parquet file
             TW->>DL: writeCommit()
-            TW->>TW: Update committed_lsn (Atomic)
+            TW->>TW: Update own committed_lsn
         end
         
+        Note over PW: LSN Aggregator
+        PW->>TW: getOldestPendingLSN()
+        PW->>PW: Calculate global min LSN
+        PW->>PW: Update global committed_lsn
+        
         opt Periodic Heartbeat (5s)
-            WR-->>WR: Read committed_lsn
-            WR->>PG: StandbyStatusUpdate(lsn)
-            Note left of PG: Advances Replication Slot
+            WR->>PG: StandbyStatusUpdate(min_lsn)
         end
     end
 ```
@@ -217,16 +225,17 @@ The `BoundedBuffer` is the primary decoupling mechanism between the producer (ne
 - **Backpressure**: When the buffer reaches its maximum capacity (default 10,000 messages), the `push()` call will block. This prevents the daemon from consuming all system memory if the disk writing or S3 upload becomes a bottleneck.
 
 ### 3. TableWriter
-The `TableWriter` is the "transaction" engine for each individual table.
-- **Design**: It encapsulates **Apache Arrow** builders to convert PostgreSQL binary tuples into highly compressed columnar format.
-- **CDC Metadata**: It automatically appends two metadata columns: `_cdc_op` (the operation type) and `_cdc_timestamp` (the processing time).
-- **Atomicity**: The write operation is a two-step process: first, a Parquet file is written to the `/data` directory; second, a Delta Lake commit (JSON) is generated. Only after both succeed is the LSN marked as "committed".
+The `TableWriter` is now a fully asynchronous worker that manages processing for a specific table in its own thread.
+- **Design**: Each `TableWriter` maintains its own `BoundedBuffer` of WAL messages. This allows a slow table (due to large schema or high write volume) to buffer independently without blocking other tables.
+- **Async Execution**: It converts PostgreSQL binary tuples into Apache Arrow format via a background `run()` loop.
+- **LSN Tracking**: It tracks both the latest LSN pushed to its queue and the latest LSN successfully committed to Delta Lake. This information is exposed for global LSN coordination.
+- **Atomicity**: The write operation remains atomic: Parquet flush followed by Delta Log commit.
 
-### 4. ParquetWriter
-The `ParquetWriter` acts as an orchestrator and multiplexer for all active tables.
-- **Design**: It runs on its own background thread, continuously popping messages from the `BoundedBuffer`.
-- **Dynamic Routing**: It maintains a map of `Relation ID -> TableWriter`. When a message arrives for a new table, it dynamically instantiates a new `TableWriter` by looking up the schema in the `TableRegistry`.
-- **Resource Management**: It ensures that all pending data is flushed to disk before the daemon shuts down cleanly.
+### 4. ParquetWriter (Dispatcher & LSN Aggregator)
+The `ParquetWriter` has evolved from a simple writer into a high-speed dispatcher.
+- **Design**: It routes messages from the global buffer to table-specific `TableWriter` queues based on the `Relation ID`.
+- **Min-LSN Safety Mechanism**: This is the most critical addition. In a parallel system, we cannot simply acknowledge the latest LSN processed by *any* table. If Table A is at LSN 100 but Table B is still processing LSN 50, acknowledging 100 would mean Table B's work is "unprotected" if the daemon crashes.
+- **LSN Aggregation**: `ParquetWriter` periodically polls all active `TableWriter` instances for their `getOldestPendingLSN()`. It calculates the **global minimum** across all writers and updates the shared `committed_lsn_` only when it is safe to do so.
 
 ### 5. DeltaLogWriter
 A static utility class that implements the **Delta Lake Transaction Log Protocol**.

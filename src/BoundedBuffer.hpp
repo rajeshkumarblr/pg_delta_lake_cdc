@@ -3,6 +3,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 
 template <typename T>
 class BoundedBuffer {
@@ -26,6 +27,17 @@ public:
     }
 
     // Optional: wait with timeout or non-blocking try_pop if needed later
+    bool pop_for(T& item, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!not_empty_.wait_for(lock, timeout, [this]() { return !queue_.empty(); })) {
+            return false;
+        }
+        item = std::move(queue_.front());
+        queue_.pop();
+        not_full_.notify_one();
+        return true;
+    }
+
     bool try_pop(T& item) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (queue_.empty()) {
@@ -35,6 +47,11 @@ public:
         queue_.pop();
         not_full_.notify_one();
         return true;
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
     }
 
     size_t size() const {

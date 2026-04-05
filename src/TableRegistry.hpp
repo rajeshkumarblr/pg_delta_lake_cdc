@@ -13,6 +13,7 @@ struct ColumnInfo {
 };
 
 struct TableInfo {
+    uint32_t rel_id;
     std::string schema;
     std::string table_name;
     std::vector<ColumnInfo> columns;

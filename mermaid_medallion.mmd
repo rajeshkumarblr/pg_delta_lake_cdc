@@ -1,0 +1,19 @@
+graph TD
+    subgraph Source
+        OP[Operational Data] -->|CRUD| PG[(PostgreSQL)]
+    end
+
+    subgraph "CDC Daemon (C++) - Bronze Layer"
+        PG -->|pgoutput| WR[WALReceiver]
+        WR -->|WAL Messages| BB((Bounded Buffer))
+        BB -->|Buffered Pop| PW[ParquetWriter]
+        PW -->|Dispatch| TQ((Per-Table Queues))
+        TQ -->|Async Process| TW[TableWriter Threads]
+        TW -->|100-row Batches| BR[(Bronze Delta Table)]
+    end
+
+    subgraph "Materializer (Spark) - Silver Layer"
+        BR -->|Incremental Read| SM[Silver Materializer]
+        SM -->|Window Deduplication| MD((Merge Logic))
+        MD -->|ACID Merge| SL[(Silver Delta Table)]
+    end

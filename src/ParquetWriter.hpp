@@ -9,6 +9,8 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <limits>
+#include <chrono>
 
 class ParquetWriter {
 public:
@@ -32,5 +34,5 @@ private:
 
     void run();
     void processMessage(const WalMessage& msg);
-    void flushAll();
+    void stopAllWriters();
 };
