@@ -19,13 +19,15 @@ public:
     ~TableWriter();
 
     void appendRow(const char* tuple_data, size_t length, uint64_t lsn);
-    void flushPartition();
+    void sendFlushSignal(uint64_t epoch_id);
+    void flushPartition(uint64_t epoch_id);
     void start();
     void stop();
 
     // Get the oldest LSN currently in this writer's pipeline (queue or being processed)
     uint64_t getOldestPendingLSN() const;
     uint64_t getLastCommittedLSN() const { return committed_lsn_val_.load(); }
+    uint64_t getLastFlushedEpoch() const { return last_flushed_epoch_.load(); }
 
 private:
     TableInfo info_;
@@ -46,11 +48,13 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> keep_running_;
     std::atomic<uint64_t> committed_lsn_val_;
+    std::atomic<uint64_t> last_flushed_epoch_;
     mutable std::mutex lsn_mtx_;
     uint64_t oldest_lsn_in_queue_;
 
     void setupSchemaAndBuilders();
     void resetBuilders();
+    std::string generateDeltaSchemaJSON();
     void run();
     void processInternal(const WalMessage& msg);
 };

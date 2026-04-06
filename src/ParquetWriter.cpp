@@ -26,37 +26,51 @@ void ParquetWriter::stop() {
 }
 
 void ParquetWriter::run() {
-    auto last_lsn_sync = std::chrono::steady_clock::now();
-    uint64_t current_global_min = 0;
+    auto last_epoch_tick = std::chrono::steady_clock::now();
+    size_t rows_since_epoch = 0;
     
     while (keep_running_) {
         WalMessage msg;
-        // Wait for up to 100ms for a message to arrive
-        if (buffer_.pop_for(msg, std::chrono::milliseconds(100))) {
+        // Drain available messages from buffer
+        while (keep_running_ && buffer_.pop_for(msg, std::chrono::milliseconds(0))) {
+            if (msg.lsn > current_max_lsn_) current_max_lsn_ = msg.lsn;
             processMessage(msg);
+            rows_since_epoch++;
+            if (rows_since_epoch >= 50000) break; // Trigger check
         }
 
-        // Periodically aggregate LSNs (every 1 second)
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_lsn_sync).count() >= 1) {
-            uint64_t min_lsn = std::numeric_limits<uint64_t>::max();
-            bool any_active = false;
-
-            for (auto& pair : writers_) {
-                uint64_t writer_min = pair.second->getOldestPendingLSN();
-                if (writer_min < min_lsn) {
-                    min_lsn = writer_min;
+        // Global epoch tick: every 10 seconds or 50,000 rows
+        if (rows_since_epoch >= 50000 || 
+            (rows_since_epoch > 0 && std::chrono::duration_cast<std::chrono::seconds>(now - last_epoch_tick).count() >= 10)) {
+            
+            uint64_t epoch_lsn = current_max_lsn_;
+            uint64_t epoch_id = current_epoch_id_++;
+            
+            std::cout << "ParquetWriter: Triggering Epoch " << epoch_id << " at LSN " << epoch_lsn << std::endl;
+            broadcastFlushSignal(epoch_id);
+            
+            // Wait for all writers to commit this epoch's data
+            bool all_ready = false;
+            while (!all_ready && keep_running_) {
+                all_ready = true;
+                for (auto& pair : writers_) {
+                    if (pair.second->getLastFlushedEpoch() < epoch_id) {
+                        // std::cout << "ParquetWriter: Still waiting for Table [" << pair.first << "] (Last Flushed: " << pair.second->getLastFlushedEpoch() << " < Current: " << epoch_id << ")" << std::endl;
+                        all_ready = false;
+                        break;
+                    }
                 }
-                any_active = true;
+                if (!all_ready) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-
-            if (any_active && min_lsn != std::numeric_limits<uint64_t>::max()) {
-                if (min_lsn > current_global_min) {
-                    current_global_min = min_lsn;
-                    committed_lsn_->store(current_global_min);
-                }
+            
+            if (keep_running_) {
+                committed_lsn_->store(epoch_lsn);
+                std::cout << "ParquetWriter: Epoch " << epoch_id << " committed. Global LSN: " << epoch_lsn << std::endl;
             }
-            last_lsn_sync = now;
+            
+            rows_since_epoch = 0;
+            last_epoch_tick = std::chrono::steady_clock::now();
         }
     }
     stopAllWriters();
@@ -76,6 +90,12 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
         }
     }
     it->second->appendRow(msg.payload.data(), msg.payload.size(), msg.lsn);
+}
+
+void ParquetWriter::broadcastFlushSignal(uint64_t epoch_id) {
+    for (auto& pair : writers_) {
+        pair.second->sendFlushSignal(epoch_id);
+    }
 }
 
 void ParquetWriter::stopAllWriters() {

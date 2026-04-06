@@ -27,6 +27,46 @@ void WALReceiver::run() {
   receiveLoop();
 }
 
+void WALReceiver::receiveLoop() {
+  uint64_t last_status_update_time = 0;
+  
+  while (keep_running_) {
+    if (PQconsumeInput(conn_) == 0) {
+        throw std::runtime_error(std::string("Error consuming input from Postgres: ") + PQerrorMessage(conn_));
+    }
+
+    char *copy_data = nullptr;
+    // Non-blocking check for data
+    int ret = PQgetCopyData(conn_, &copy_data, 1); // 1 = non-blocking
+
+    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+
+    if (now - last_status_update_time > 5) {
+        sendStandbyStatusUpdate(committed_lsn_->load());
+        last_status_update_time = now;
+    }
+
+    if (ret == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    } else if (ret == -1) {
+      std::cout << "End of COPY data stream from PostgreSQL." << std::endl;
+      if (PGresult *res = PQgetResult(conn_)) {
+        std::cerr << "Postgres FATAL Error: " << PQerrorMessage(conn_) << std::endl;
+        PQclear(res);
+      }
+      return;
+    } else if (ret == -2) {
+      throw std::runtime_error(std::string("Error during PQgetCopyData: ") + PQerrorMessage(conn_));
+    }
+
+    handleCopyData(copy_data, ret);
+    PQfreemem(copy_data);
+  }
+}
+
 void WALReceiver::connect() {
   PGconn *normal_conn = PQconnectdb(conninfo_.c_str());
   if (PQstatus(normal_conn) != CONNECTION_OK) {
@@ -136,50 +176,6 @@ void WALReceiver::startLogicalReplication() {
             << "'." << std::endl;
 }
 
-void WALReceiver::receiveLoop() {
-  while (keep_running_) {
-    char *copy_data = nullptr;
-    int ret = PQgetCopyData(conn_, &copy_data, 0); // 0 = block waiting for data
-
-    static uint64_t last_status_update_time = 0;
-    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-
-    switch (ret) {
-    case 0: // No data currently available
-      // Periodically send status update even if no data
-      if (now - last_status_update_time > 5) {
-        sendStandbyStatusUpdate(committed_lsn_->load());
-        last_status_update_time = now;
-      }
-      continue;
-    case -1: // End of stream
-      std::cout << "End of COPY data stream from PostgreSQL." << std::endl;
-      if (PGresult *res = PQgetResult(conn_)) {
-        std::cerr << "Postgres FATAL Error: " << PQerrorMessage(conn_)
-                  << std::endl;
-        PQclear(res);
-      }
-      return; // Exit receiveLoop
-    case -2:  // Error occurred
-      throw std::runtime_error(std::string("Error during PQgetCopyData: ") +
-                               PQerrorMessage(conn_));
-    default:
-      if (ret > 0) {
-        handleCopyData(copy_data, ret);
-        PQfreemem(copy_data);
-
-        // Also update after data processing if enough time passed
-        if (now - last_status_update_time > 5) {
-          sendStandbyStatusUpdate(committed_lsn_->load());
-          last_status_update_time = now;
-        }
-      }
-      break;
-    }
-  }
-}
 
 void WALReceiver::handleCopyData(char *msg, int length) {
   if (length == 0)
@@ -337,7 +333,11 @@ void WALReceiver::handleDataMessage(char *payload, int length, uint64_t lsn) {
     wal_msg.relation_id = relation_id;
     wal_msg.lsn = lsn;
     wal_msg.payload.assign(payload, payload + length);
-    buffer_.push(std::move(wal_msg));
+    
+    // Heartbeat-aware backpressure
+    while (keep_running_ && !buffer_.push_for(std::move(wal_msg), std::chrono::milliseconds(1000))) {
+        sendStandbyStatusUpdate(committed_lsn_->load());
+    }
   }
 }
 

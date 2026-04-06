@@ -23,10 +23,10 @@ graph TD
     subgraph "CDC Daemon (C++) - Bronze Layer"
         PG -->|pgoutput| WR[WALReceiver]
         WR -->|WAL Messages| BB((Bounded Buffer))
-        BB -->|Buffered Pop| PW[ParquetWriter]
-        PW -->|Dispatch| TQ((Per-Table Queues))
+        BB -->|Buffered Drain| PW[ParquetWriter]
+        PW -->|Epoch Signal| TQ((Per-Table Queues))
         TQ -->|Async Process| TW[TableWriter Threads]
-        TW -->|100-row Batches| BR[(Bronze Delta Table)]
+        TW -->|Epoch-aligned Parquet| BR[(Bronze Delta Table)]
     end
 
     subgraph "Materializer (Spark) - Silver Layer"
@@ -77,10 +77,12 @@ classDiagram
         -TableRegistryPtr registry
         -atomic~uint64_t~* committed_lsn
         -unordered_map<uint32_t, TableWriterPtr> writers
+        -uint64_t current_epoch_id
         +start()
         +stop()
         -run()
         -processMessage()
+        -broadcastFlushSignal(epoch_id)
     }
 
     class TableWriter {
@@ -88,19 +90,24 @@ classDiagram
         -BoundedBuffer~WalMessage~ queue
         -thread worker_thread
         -atomic~uint64_t~ committed_lsn_val
+        -atomic~uint64_t~ last_flushed_epoch
         -uint64_t latest_lsn
         +start()
         +stop()
         +appendRow()
-        +getOldestPendingLSN()
+        +sendFlushSignal(epoch_id)
+        +getLastFlushedEpoch()
         -run()
         -processInternal()
+        -generateDeltaSchemaJSON()
     }
 
     class WalMessage {
         +uint32_t relation_id
         +uint64_t lsn
         +vector~char~ payload
+        +bool is_flush_signal
+        +uint64_t epoch_id
     }
 
     class DeltaLogWriter {
@@ -160,27 +167,26 @@ sequenceDiagram
 
     loop CDC Loop
         PG->>WR: CopyData (WAL Message)
-        WR->>BB: push(WalMessage)
+        Note over WR: Non-blocking IO + Heartbeats
+        WR->>BB: push_for(WalMessage, timeout)
         
-        BB->>PW: pop()
+        Note over PW: Coordinator
+        BB->>PW: Drain available messages
         PW->>TW: dispatch to queue
         
-        Note over TW: Async Processing Thread
-        TW->>TW: processInternal()
-        
-        opt row_group_size reached
-            TW->>TW: flushPartition()
-            TW->>DL: writeCommit()
-            TW->>TW: Update own committed_lsn
+        opt Epoch Trigger (10s or 50k rows)
+            PW->>TW: sendFlushSignal(epoch_id)
+            Note over TW: Worker sync phase
+            TW->>TW: flushPartition(epoch_id)
+            TW->>DL: writeCommit(dynamic_schema)
+            TW->>TW: Update last_flushed_epoch
+            PW->>TW: Check getLastFlushedEpoch()
+            PW->>PW: Advance global committed_lsn
         end
         
-        Note over PW: LSN Aggregator
-        PW->>TW: getOldestPendingLSN()
-        PW->>PW: Calculate global min LSN
-        PW->>PW: Update global committed_lsn
-        
+        Note over WR: Independent Heartbeat
         opt Periodic Heartbeat (5s)
-            WR->>PG: StandbyStatusUpdate(min_lsn)
+            WR->>PG: StandbyStatusUpdate(global_lsn)
         end
     end
 ```
@@ -215,9 +221,9 @@ sequenceDiagram
 
 ### 1. WALReceiver
 The `WALReceiver` is a networking component responsible for the high-performance ingestion of PostgreSQL change events.
-- **Design**: Implemented using `libpq` for the PostgreSQL wire protocol. It establishes a `LOGICAL_REPLICATION` connection using the `pgoutput` plugin.
-- **LSN Extraction**: Every WAL message ('w') contains a 64-bit Log Sequence Number (LSN). The receiver parses this from the binary stream (using `be64toh` for endian conversion) and associates it with the data payload.
-- **Feedback Loop**: It hosts a 5-second recurring timer that reads a shared `committed_lsn` value (populated by the writers) and sends a `Status Update` back to PostgreSQL. This tells the server it can safely rotate its WAL logs.
+- **Design**: Implemented using `libpq` for the PostgreSQL wire protocol. Uses a non-blocking IO loop (`PQconsumeInput` + `PQgetCopyData`).
+- **Heartbeat Safety**: Implements a dedicated status update mechanism that continues to send heartbeats to PostgreSQL even if the dispatcher pipeline is temporarily blocked (backpressure), preventing slot timeout.
+- **LSN Extraction**: Every WAL message ('w') contains a 64-bit Log Sequence Number (LSN). The receiver parses this and associates it with the data payload.
 
 ### 2. BoundedBuffer
 The `BoundedBuffer` is the primary decoupling mechanism between the producer (network) and consumer (disk) threads.
@@ -228,14 +234,15 @@ The `BoundedBuffer` is the primary decoupling mechanism between the producer (ne
 The `TableWriter` is now a fully asynchronous worker that manages processing for a specific table in its own thread.
 - **Design**: Each `TableWriter` maintains its own `BoundedBuffer` of WAL messages. This allows a slow table (due to large schema or high write volume) to buffer independently without blocking other tables.
 - **Async Execution**: It converts PostgreSQL binary tuples into Apache Arrow format via a background `run()` loop.
-- **LSN Tracking**: It tracks both the latest LSN pushed to its queue and the latest LSN successfully committed to Delta Lake. This information is exposed for global LSN coordination.
+- **Dynamic Schema**: Generates the Delta Lake JSON schema dynamically from PostgreSQL metadata on every partition flush.
+- **LSN Tracking**: It tracks both the latest LSN pushed to its queue and the latest LSN successfully committed to Delta Lake.
 - **Atomicity**: The write operation remains atomic: Parquet flush followed by Delta Log commit.
 
 ### 4. ParquetWriter (Dispatcher & LSN Aggregator)
 The `ParquetWriter` has evolved from a simple writer into a high-speed dispatcher.
-- **Design**: It routes messages from the global buffer to table-specific `TableWriter` queues based on the `Relation ID`.
-- **Min-LSN Safety Mechanism**: This is the most critical addition. In a parallel system, we cannot simply acknowledge the latest LSN processed by *any* table. If Table A is at LSN 100 but Table B is still processing LSN 50, acknowledging 100 would mean Table B's work is "unprotected" if the daemon crashes.
-- **LSN Aggregation**: `ParquetWriter` periodically polls all active `TableWriter` instances for their `getOldestPendingLSN()`. It calculates the **global minimum** across all writers and updates the shared `committed_lsn_` only when it is safe to do so.
+- **Global Epoch Coordination**: Implements cross-table ACID consistency by triggering global "epochs".
+- **Barrier Synchronization**: Periodically broadcasts flush signals to all active `TableWriter` threads and waits for them to acknowledge completion before advancing the global replication LSN.
+- **Min-LSN Safety Mechanism**: Ensures that the global replication slot only advances to the minimum LSN successfully committed across all parallel tables, preventing data loss on restarts.
 
 ### 5. DeltaLogWriter
 A static utility class that implements the **Delta Lake Transaction Log Protocol**.

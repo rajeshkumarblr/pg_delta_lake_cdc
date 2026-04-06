@@ -17,6 +17,16 @@ public:
         not_empty_.notify_one();
     }
 
+    bool push_for(T item, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!not_full_.wait_for(lock, timeout, [this]() { return queue_.size() < max_size_; })) {
+            return false;
+        }
+        queue_.push(std::move(item));
+        not_empty_.notify_one();
+        return true;
+    }
+
     T pop() {
         std::unique_lock<std::mutex> lock(mutex_);
         not_empty_.wait(lock, [this]() { return !queue_.empty(); });

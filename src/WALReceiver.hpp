@@ -12,6 +12,8 @@ struct WalMessage {
   uint32_t relation_id;
   uint64_t lsn;
   std::vector<char> payload;
+  bool is_flush_signal = false;
+  uint64_t epoch_id = 0;
 };
 
 class WALReceiver {

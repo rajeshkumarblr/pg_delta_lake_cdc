@@ -12,7 +12,7 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
     : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), 
       row_group_size_(row_group_size), current_rows_(0), commit_version_(0), latest_lsn_(0), 
       global_committed_lsn_(committed_lsn), queue_(10000), keep_running_(false), 
-      committed_lsn_val_(0), oldest_lsn_in_queue_(0) {
+      committed_lsn_val_(0), last_flushed_epoch_(0), oldest_lsn_in_queue_(0) {
     setupSchemaAndBuilders();
 }
 
@@ -45,75 +45,73 @@ void TableWriter::run() {
         WalMessage msg;
         if (queue_.pop_for(msg, std::chrono::milliseconds(100))) {
             if (msg.relation_id == 0) continue; // Dummy message
+            
+            // DEBUG LOGGING
+            if (msg.is_flush_signal) {
+                std::cout << "TableWriter [" << info_.table_name << "]: Received flush signal for Epoch " << msg.epoch_id << std::endl;
+            }
+            
             processInternal(msg);
         }
     }
     // Final flush on exit
     if (current_rows_ > 0) {
-        flushPartition();
+        flushPartition(0); // Use 0 for final exit flush if no epoch
     }
 }
 
 void TableWriter::setupSchemaAndBuilders() {
     std::vector<std::shared_ptr<arrow::Field>> fields;
     
+    auto pool = arrow::default_memory_pool();
+    builders_.clear();
+
     for (const auto& col : info_.columns) {
         std::shared_ptr<arrow::DataType> arrow_type;
+        std::shared_ptr<arrow::ArrayBuilder> builder;
         const std::string& dt = col.data_type;
         
         if (dt == "integer" || dt == "int4" || dt == "serial") {
             arrow_type = arrow::int32();
+            builder = std::make_shared<arrow::Int32Builder>(pool);
         } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
             arrow_type = arrow::int64();
+            builder = std::make_shared<arrow::Int64Builder>(pool);
         } else if (dt == "real" || dt == "float4") {
             arrow_type = arrow::float32();
+            builder = std::make_shared<arrow::FloatBuilder>(pool);
         } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
             arrow_type = arrow::float64();
+            builder = std::make_shared<arrow::DoubleBuilder>(pool);
         } else if (dt == "boolean" || dt == "bool") {
             arrow_type = arrow::boolean();
+            builder = std::make_shared<arrow::BooleanBuilder>(pool);
         } else {
-            arrow_type = arrow::utf8(); // fallback to string
+            arrow_type = arrow::utf8(); 
+            builder = std::make_shared<arrow::StringBuilder>(pool);
         }
         
         fields.push_back(arrow::field(col.name, arrow_type, col.is_nullable));
+        builders_.push_back(builder);
     }
     
     // Add metadata columns
     fields.push_back(arrow::field("_cdc_op", arrow::utf8(), false));
     fields.push_back(arrow::field("_cdc_timestamp", arrow::int64(), false));
     
+    builders_.push_back(std::make_shared<arrow::StringBuilder>(pool)); // _cdc_op
+    builders_.push_back(std::make_shared<arrow::Int64Builder>(pool));   // _cdc_timestamp
+
     schema_ = arrow::schema(fields);
-    resetBuilders();
+    current_rows_ = 0;
+    insert_count_ = 0;
+    update_count_ = 0;
 }
 
 void TableWriter::resetBuilders() {
-    builders_.clear();
-    auto pool = arrow::default_memory_pool();
-    
-    for (const auto& col : info_.columns) {
-        std::shared_ptr<arrow::ArrayBuilder> builder;
-        const std::string& dt = col.data_type;
-        
-        if (dt == "integer" || dt == "int4" || dt == "serial") {
-            builder = std::make_shared<arrow::Int32Builder>(pool);
-        } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
-            builder = std::make_shared<arrow::Int64Builder>(pool);
-        } else if (dt == "real" || dt == "float4") {
-            builder = std::make_shared<arrow::FloatBuilder>(pool);
-        } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
-            builder = std::make_shared<arrow::DoubleBuilder>(pool);
-        } else if (dt == "boolean" || dt == "bool") {
-            builder = std::make_shared<arrow::BooleanBuilder>(pool);
-        } else {
-            builder = std::make_shared<arrow::StringBuilder>(pool);
-        }
-        builders_.push_back(builder);
+    for (auto& builder : builders_) {
+        builder->Reset();
     }
-    
-    // Builders for metadata
-    builders_.push_back(std::make_shared<arrow::StringBuilder>(pool)); // _cdc_op
-    builders_.push_back(std::make_shared<arrow::Int64Builder>(pool));   // _cdc_timestamp
-    
     current_rows_ = 0;
     insert_count_ = 0;
     update_count_ = 0;
@@ -135,6 +133,14 @@ void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn) {
     queue_.push(msg);
 }
 
+void TableWriter::sendFlushSignal(uint64_t epoch_id) {
+    WalMessage msg;
+    msg.is_flush_signal = true;
+    msg.epoch_id = epoch_id;
+    msg.relation_id = info_.rel_id;
+    queue_.push(msg);
+}
+
 uint64_t TableWriter::getOldestPendingLSN() const {
     std::lock_guard<std::mutex> lock(lsn_mtx_);
     if (queue_.empty()) {
@@ -143,7 +149,43 @@ uint64_t TableWriter::getOldestPendingLSN() const {
     return oldest_lsn_in_queue_;
 }
 
+std::string TableWriter::generateDeltaSchemaJSON() {
+    std::string json = "{\"type\":\"struct\",\"fields\":[";
+    for (size_t i = 0; i < info_.columns.size(); ++i) {
+        const auto& col = info_.columns[i];
+        std::string delta_type;
+        const std::string& dt = col.data_type;
+
+        if (dt == "integer" || dt == "int4" || dt == "serial") {
+            delta_type = "integer";
+        } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
+            delta_type = "long";
+        } else if (dt == "boolean" || dt == "bool") {
+            delta_type = "boolean";
+        } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
+            delta_type = "double";
+        } else {
+            delta_type = "string";
+        }
+
+        if (i > 0) json += ",";
+        json += "{\"name\":\"" + col.name + "\",\"type\":\"" + delta_type + "\",\"nullable\":" + (col.is_nullable ? "true" : "false") + ",\"metadata\":{}}";
+    }
+
+    // Add CDC columns
+    json += ",{\"name\":\"_cdc_op\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}";
+    json += ",{\"name\":\"_cdc_timestamp\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}";
+    
+    json += "]}";
+    return json;
+}
+
 void TableWriter::processInternal(const WalMessage& msg) {
+    if (msg.is_flush_signal) {
+        flushPartition(msg.epoch_id);
+        return;
+    }
+
     uint64_t lsn = msg.lsn;
     const char* data = msg.payload.data();
     size_t length = msg.payload.size();
@@ -268,14 +310,18 @@ void TableWriter::processInternal(const WalMessage& msg) {
     }
     
     if (current_rows_ >= row_group_size_) {
-        flushPartition();
+        flushPartition(0); // Regular flush
     }
 }
 
-void TableWriter::flushPartition() {
-    if (current_rows_ == 0) return;
+void TableWriter::flushPartition(uint64_t epoch_id) {
+    if (current_rows_ == 0) {
+        committed_lsn_val_.store(latest_lsn_);
+        last_flushed_epoch_.store(epoch_id);
+        return;
+    }
     
-    std::cout << "TableWriter [" << info_.table_name << "]: Writing Parquet batch..." << std::endl;
+    std::cout << "TableWriter [" << info_.table_name << "]: Writing Parquet batch (Epoch " << epoch_id << ") with " << current_rows_ << " rows..." << std::endl;
     
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     for (auto& builder : builders_) {
@@ -288,7 +334,12 @@ void TableWriter::flushPartition() {
     std::string table_dir = output_dir_.empty() ? info_.table_name : (output_dir_ + "/" + info_.table_name);
     std::filesystem::create_directories(table_dir);
     
-    std::string filename = info_.table_name + "_" + std::to_string(++file_counter_) + ".parquet";
+    std::string filename;
+    if (epoch_id > 0) {
+        filename = info_.table_name + "_epoch_" + std::to_string(epoch_id) + ".parquet";
+    } else {
+        filename = info_.table_name + "_" + std::to_string(++file_counter_) + ".parquet";
+    }
     std::string full_path = table_dir + "/" + filename;
     
     std::shared_ptr<arrow::io::FileOutputStream> outfile;
@@ -298,17 +349,13 @@ void TableWriter::flushPartition() {
     
     std::cout << "TableWriter [" << info_.table_name << "]: Wrote " << filename << std::endl;
 
-    // Delta Protocol Generation (Simplified)
+    // Delta Protocol Generation
     size_t file_size = std::filesystem::file_size(full_path);
-    // Reuse schema generation logic from previous version if needed, 
-    // for now we use a generic structural placeholder since user didn't ask for schema refactoring
-    std::string schema_placeholder = "{}"; 
-    DeltaLogWriter::writeCommit(table_dir, commit_version_++, filename, file_size, schema_placeholder);
+    std::string dynamic_schema = generateDeltaSchemaJSON();
+    DeltaLogWriter::writeCommit(table_dir, commit_version_++, filename, file_size, dynamic_schema);
     
     committed_lsn_val_.store(latest_lsn_);
+    last_flushed_epoch_.store(epoch_id);
     
-    // NOTE: We don't update the global_committed_lsn_ directly here anymore.
-    // Instead, ParquetWriter will aggregate the minimum across all tables.
-
     resetBuilders();
 }
