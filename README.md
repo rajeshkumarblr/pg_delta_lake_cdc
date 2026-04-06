@@ -2,13 +2,11 @@
 
 A high-performance PostgreSQL-to-Delta Lake CDC (Change Data Capture) pipeline. This project implements a C++20 daemon for real-time "Bronze" ingestion and a Spark Structured Streaming application for "Silver" materialization.
 
-![End-to-End Medallion Architecture](images/end_to_end_architecture.png)
-
 ## High-Level Overview
 
 ```mermaid
 graph LR
-    PG[(PostgreSQL)] --> CDC[CDC Engine]
+    PG[(PostgreSQL)] -- WAL Stream --> CDC[CDC Engine]
     CDC --> DL[Delta Logs + Parquet]
     DL --> AJ[Analytics Jobs]
 ```
