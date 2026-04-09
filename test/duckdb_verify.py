@@ -46,11 +46,11 @@ def verify():
             count(*) as cnt,
             sum(score) as score_sum
         FROM (
-            SELECT id, score, _cdc_lsn, _cdc_timestamp,
+            SELECT id, score, _cdc_op, _cdc_lsn, _cdc_timestamp,
                    row_number() OVER (PARTITION BY id ORDER BY _cdc_lsn DESC, _cdc_timestamp DESC) as rn
             FROM read_parquet('{parquet_pattern}', union_by_name=True)
         ) 
-        WHERE rn = 1
+        WHERE rn = 1 AND _cdc_op != 'DELETE'
     """
     
     stats = con.execute(query).fetchone()
@@ -69,18 +69,34 @@ def verify():
     schema_check = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{parquet_pattern}', union_by_name=True)").fetchall()
     column_names = [r[0] for r in schema_check]
     has_evolved_cols = "priority" in column_names and "tags" in column_names
+    
+    # 5. Check for DELETE operations (Bronze layer)
+    res_delete = con.execute(f"SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True) WHERE _cdc_op = 'DELETE'").fetchone()[0]
+    print(f"Delete Records in Bronze: {res_delete} (Expected: 1)")
 
+    # 6. Secondary Table Verification
+    secondary_path = "/app/data/secondary_test/*.parquet"
+    res_secondary = 0
+    if os.path.exists("/app/data/secondary_test"):
+         res_secondary = con.execute(f"SELECT count(*) FROM read_parquet('{secondary_path}')").fetchone()[0]
+    
     print("-" * 40)
     print("VERIFICATION RESULTS (DUCKDB)")
-    print(f"Expected Count: {expected['COUNT']}, Actual: {actual_count}")
-    print(f"Expected Sum:   {expected['SUM']:.4f}, Actual: {actual_sum:.4f}")
+    print(f"Expected Count (Main): {expected['COUNT']}, Actual: {actual_count}")
+    print(f"Expected Sum   (Main): {expected['SUM']:.4f}, Actual: {actual_sum:.4f}")
+    print(f"Expected Count (Sec):  {expected['SECONDARY_COUNT']}, Actual: {res_secondary}")
     print(f"Rollback Check: {rollback_check} rows found (Expected: 0)")
+    print(f"Delete Check:   {res_delete} rows found (Expected: 1)")
     print(f"Schema Evolution: {'SUCCESS' if has_evolved_cols else 'FAILED'} (Columns: {', '.join(column_names)})")
     print("-" * 40)
 
     success = True
     if actual_count != int(expected['COUNT']):
-        print("FAIL: Row count mismatch!")
+        print(f"FAIL: Row count mismatch in primary table! Expected {expected['COUNT']}, got {actual_count}")
+        success = False
+    
+    if res_secondary != int(expected['SECONDARY_COUNT']):
+        print(f"FAIL: Row count mismatch in secondary table! Expected {expected['SECONDARY_COUNT']}, got {res_secondary}")
         success = False
     
     if abs(float(actual_sum) - expected['SUM']) > 0.1:

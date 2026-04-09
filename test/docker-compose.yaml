@@ -38,7 +38,7 @@ services:
       PG_CONNINFO: postgresql://hn_user:my_hn_pass%241234%23@postgres:5432/my_hn?sslmode=disable
       PG_SLOT_NAME: hn_stories_slot
       PG_PUBLICATION_NAME: hn_stories_pub
-      OUTPUT_DIR: /app/data
+      OUTPUT_DIR: file:///app/data
     volumes:
       - ./data:/app/data
     depends_on:

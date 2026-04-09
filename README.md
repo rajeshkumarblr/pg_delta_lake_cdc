@@ -15,11 +15,12 @@ graph LR
 This pipeline captures real-time database changes (WAL) utilizing PostgreSQL's native `pgoutput` plugin, pivots them into optimized Apache Arrow/Parquet layouts, and incrementally merges them into a refined Silver layer for analytics.
 
 ### Feature Highlights
-- **Production-Ready CDC (100% Data Integrity)**: Verified against a 10,015-row stress test covering complex transaction boundaries and schema changes.
+- **Production-Ready CDC (100% Data Integrity)**: Verified against a 10,016-row stress test covering complex transaction boundaries, schema changes, and multi-table synchronization.
 - **Transactional Atomicity (ACID)**: Implemented `BEGIN`/`COMMIT` protocol awareness. Data is only flushed at transaction boundaries, ensuring no partial or rolled-back rows are visible.
 - **Dynamic Schema Evolution**: Runtime detection of `ALTER TABLE` changes. Automatically handles column additions with robust NULL-padding and Delta Log metadata updates.
+- **Full DELETE Support**: Native streaming of `DELETE` events via `REPLICA IDENTITY`. Generates tombstone records for ACID-compliant materialization in downstream Silver layers.
+- **Cloud-Native Storage (S3/Azure/GCS)**: Refactored storage layer using Apache Arrow's `FileSystem` API. Supports URI-based sinks (e.g., `s3://bucket/path`) with automatic scheme detection.
 - **Parallel Per-Table Streaming**: High-throughput multi-threaded architecture with independent queues for each table.
-- **Stability & Protocol Resilience**: Non-blocking Global Epoch synchronization and heartbeat-aware buffer pushes ensure the replication slot stays alive even under heavy backpressure.
 - **Integrated Verification Suite**: Native DuckDB-based integration tests for validating data integrity, schema consistency, and rollback handling.
 - **Native Delta Lake Producer**: Generates ACID-compliant `_delta_log` transaction entries alongside LSN-named Parquet files.
 - **CDC Metadata Injection**: Automatically injects `_cdc_op`, `_cdc_timestamp`, and `_cdc_lsn` into every row for downstream deduplication.
@@ -76,7 +77,9 @@ The daemon utilizes a `.env` file for zero-config startup. Create a `.env` in th
 PG_CONNINFO=postgres://user:pass@localhost:5432/my_hn?sslmode=disable
 PG_SLOT_NAME=hn_stories_slot
 PG_PUBLICATION_NAME=hn_stories_pub
-OUTPUT_DIR=data
+
+# Local Path or Cloud URI (s3://, az://, gs://, file://)
+OUTPUT_DIR=file:///absolute/path/to/data
 ```
 
 ## Testing & Stress Testing
@@ -89,7 +92,12 @@ The `test/` directory contains a high-speed ingestion service (`hn_ingest`) desi
 ## Deployment
 1. **Initialize PostgreSQL Publication**:
    ```sql
-   CREATE PUBLICATION hn_stories_pub FOR TABLE stories;
+   -- Create publication for all or specific tables
+   CREATE PUBLICATION hn_stories_pub FOR ALL TABLES;
+   
+   -- Ensure tables have PK or REPLICA IDENTITY FULL for DELETE/UPDATE support
+   ALTER TABLE stories REPLICA IDENTITY FULL;
+   
    SELECT pg_create_logical_replication_slot('hn_stories_slot', 'pgoutput');
    ```
 

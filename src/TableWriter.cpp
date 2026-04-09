@@ -1,4 +1,8 @@
 #include "TableWriter.hpp"
+#include <arrow/filesystem/filesystem.h>
+#include <arrow/filesystem/localfs.h>
+#include <arrow/result.h>
+#include <parquet/exception.h>
 #include <iostream>
 #include <chrono>
 #include <arpa/inet.h>
@@ -9,9 +13,36 @@
 TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir, 
                          std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
                          size_t row_group_size)
-    : info_(info), output_dir_(output_dir), global_committed_lsn_(committed_lsn), 
-      row_group_size_(row_group_size), file_counter_(1), current_rows_(0), 
+    : info_(info), output_dir_(output_dir), file_counter_(1),
+      insert_count_(0), update_count_(0), delete_count_(0),
+      row_group_size_(row_group_size), current_rows_(0),
+      global_committed_lsn_(committed_lsn), 
       keep_running_(false), oldest_lsn_in_queue_(0), pending_epoch_(0), queue_(10000) {
+    // Initialize FileSystem from URI or local path
+    if (!output_dir_.empty()) {
+        std::string path;
+        std::string uri = output_dir_;
+        // If no scheme is provided, assume local path and prepend file://
+        if (uri.find("://") == std::string::npos) {
+            if (uri[0] != '/') {
+                // Prepend current path for relative paths
+                uri = "file://" + std::filesystem::current_path().string() + "/" + uri;
+            } else {
+                uri = "file://" + uri;
+            }
+        }
+        
+        auto result = arrow::fs::FileSystemFromUri(uri, &path);
+        if (!result.ok()) {
+            throw std::runtime_error("Failed to initialize filesystem from " + uri + ": " + result.status().ToString());
+        }
+        fs_ = result.ValueOrDie();
+        base_path_ = path;
+    } else {
+        fs_ = std::make_shared<arrow::fs::LocalFileSystem>();
+        base_path_ = std::filesystem::current_path().string();
+    }
+
     setupSchemaAndBuilders();
 }
 
@@ -228,21 +259,15 @@ void TableWriter::processInternal(const WalMessage& msg) {
     size_t offset = 1; // Skip message type 'I', 'U', 'D'
     offset += 4; // Skip relation_id
     
-    switch (msg_type) {
-        case 'D': return; // Deletes not yet fully supported in builders
-        case 'U': {
-            while (offset < length && data[offset] != 'N') {
-                offset++;
-            }
-            break;
+    if (msg_type == 'U') {
+        while (offset < length && data[offset] != 'N') {
+            offset++; 
         }
-        default:
-            break;
     }
 
     if (offset + 1 > length) return;
-    const char n_type = data[offset++];
-    if (n_type != 'N') return;
+    const char tuple_type = data[offset++];
+    if (tuple_type != 'N' && tuple_type != 'K' && tuple_type != 'O') return;
     
     if (offset + 2 > length) return;
     uint16_t ncolumns_n;
@@ -251,62 +276,75 @@ void TableWriter::processInternal(const WalMessage& msg) {
     offset += 2;
     
     bool all_ok = true;
-    for (uint16_t col = 0; col < ncolumns && col < info_.columns.size() && offset < length; ++col) {
-        char kind = data[offset++];
-        auto& builder = builders_[col];
-        
-        switch (kind) {
-            case 'n': 
-            case 'u':
-                if (!builder->AppendNull().ok()) all_ok = false;
-                break;
-            case 't':
-            case 'b': {
-                if (offset + 4 > length) return;
-                uint32_t col_len_n;
-                std::memcpy(&col_len_n, data + offset, 4);
-                uint32_t col_len = ntohl(col_len_n);
-                offset += 4;
+    uint16_t consumed_count = 0;
 
-                if (offset + col_len > length) return;
-                std::string col_val(data + offset, col_len);
-                offset += col_len;
+    for (size_t col = 0; col < info_.columns.size(); ++col) {
+        bool should_parse = false;
+        if (tuple_type == 'N' || tuple_type == 'O') {
+            should_parse = (consumed_count < ncolumns);
+        } else if (tuple_type == 'K') {
+            // In 'K' (Key) mode, PG only sends primary key columns
+            should_parse = (consumed_count < ncolumns && info_.columns[col].pk_flag);
+        }
 
-                arrow::Status status;
-                const std::string& dt = info_.columns[col].data_type;
+        if (should_parse && offset < length) {
+            char kind = data[offset++];
+            auto& builder = builders_[col];
+            consumed_count++;
 
-                if (dt == "integer" || dt == "int4" || dt == "serial") {
-                    auto* b = static_cast<arrow::Int32Builder*>(builder.get());
-                    try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
-                } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
-                    auto* b = static_cast<arrow::Int64Builder*>(builder.get());
-                    try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
-                } else if (dt == "real" || dt == "float4") {
-                    auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
-                    try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
-                } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
-                    auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
-                    try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
-                } else if (dt == "boolean" || dt == "bool") {
-                    auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
-                    bool val = (col_val == "t" || col_val == "true" || col_val == "1");
-                    status = b->Append(val);
-                } else {
-                    auto* b = static_cast<arrow::StringBuilder*>(builder.get());
-                    status = b->Append(col_val);
+            switch (kind) {
+                case 'n': 
+                case 'u':
+                    if (!builder->AppendNull().ok()) all_ok = false;
+                    break;
+                case 't':
+                case 'b': {
+                    if (offset + 4 > length) return;
+                    uint32_t col_len_n;
+                    std::memcpy(&col_len_n, data + offset, 4);
+                    uint32_t col_len = ntohl(col_len_n);
+                    offset += 4;
+
+                    if (offset + col_len > length) return;
+                    std::string col_val(data + offset, col_len);
+                    offset += col_len;
+
+                    arrow::Status status;
+                    const std::string& dt = info_.columns[col].data_type;
+
+                    if (dt == "integer" || dt == "int4" || dt == "serial") {
+                        auto* b = static_cast<arrow::Int32Builder*>(builder.get());
+                        try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
+                    } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
+                        auto* b = static_cast<arrow::Int64Builder*>(builder.get());
+                        try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
+                    } else if (dt == "real" || dt == "float4") {
+                        auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
+                        try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
+                    } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
+                        auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
+                        try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
+                    } else if (dt == "boolean" || dt == "bool") {
+                        auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
+                        bool val = (col_val == "t" || col_val == "true" || col_val == "1");
+                        status = b->Append(val);
+                    } else {
+                        auto* b = static_cast<arrow::StringBuilder*>(builder.get());
+                        status = b->Append(col_val);
+                    }
+                    if (!status.ok()) all_ok = false;
+                    break;
                 }
-                if (!status.ok()) all_ok = false;
-                break;
+                default:
+                    break;
             }
-            default:
-                break;
+        } else {
+            // Missing column: Append NULL
+            if (!builders_[col]->AppendNull().ok()) all_ok = false;
         }
     }
     
-    // PAD: If the message had fewer columns than we expect, append NULL to the remaining ones
-    for (size_t col = ncolumns; col < info_.columns.size(); ++col) {
-        if (!builders_[col]->AppendNull().ok()) all_ok = false;
-    }
+    // All columns (including metadata) are now padded in the loop above or below.
     
     if (all_ok) {
         size_t col_idx = info_.columns.size();
@@ -314,7 +352,11 @@ void TableWriter::processInternal(const WalMessage& msg) {
         auto* ts_builder = static_cast<arrow::Int64Builder*>(builders_[col_idx++].get());
         auto* lsn_builder = static_cast<arrow::UInt64Builder*>(builders_[col_idx++].get());
         
-        std::string op_str = (msg_type == 'I') ? "INSERT" : "UPDATE";
+        std::string op_str = "UNKNOWN";
+        if (msg_type == 'I') op_str = "INSERT";
+        else if (msg_type == 'U') op_str = "UPDATE";
+        else if (msg_type == 'D') op_str = "DELETE";
+
         uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         
         if (!op_builder->Append(op_str).ok()) all_ok = false;
@@ -326,6 +368,7 @@ void TableWriter::processInternal(const WalMessage& msg) {
         current_rows_++;
         if (msg_type == 'I') insert_count_++;
         else if (msg_type == 'U') update_count_++;
+        else if (msg_type == 'D') delete_count_++;
 
         if (current_rows_ % 10 == 0) {
             std::cout << "TableWriter [" << info_.table_name << "]: Progress " << current_rows_ << "/" << row_group_size_ << std::endl;
@@ -354,8 +397,8 @@ void TableWriter::flushPartition(uint64_t epoch_id) {
     }
     
     std::shared_ptr<arrow::Table> table = arrow::Table::Make(schema_, arrays);
-    std::string table_dir = output_dir_.empty() ? info_.table_name : (output_dir_ + "/" + info_.table_name);
-    std::filesystem::create_directories(table_dir);
+    std::string table_dir = base_path_ + "/" + info_.table_name;
+    PARQUET_THROW_NOT_OK(fs_->CreateDir(table_dir));
     
     std::string filename;
     if (epoch_id > 0) {
@@ -365,17 +408,21 @@ void TableWriter::flushPartition(uint64_t epoch_id) {
     }
     std::string full_path = table_dir + "/" + filename;
     
-    std::shared_ptr<arrow::io::FileOutputStream> outfile;
-    PARQUET_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(full_path));
+    std::shared_ptr<arrow::io::OutputStream> outfile;
+    PARQUET_ASSIGN_OR_THROW(outfile, fs_->OpenOutputStream(full_path));
     PARQUET_THROW_NOT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, current_rows_));
     PARQUET_THROW_NOT_OK(outfile->Close());
     
     std::cout << "TableWriter [" << info_.table_name << "]: Wrote " << filename << std::endl;
 
     // Delta Protocol Generation
-    size_t file_size = std::filesystem::file_size(full_path);
+    // Note: base_path_ might be a URI, so we can't use std::filesystem::file_size easily.
+    // However, OpenOutputStream gives us the ability to track size, or we can use fs_->GetFileInfo.
+    auto file_info = fs_->GetFileInfo(full_path).ValueOrDie();
+    size_t file_size = file_info.size();
+    
     std::string dynamic_schema = generateDeltaSchemaJSON();
-    DeltaLogWriter::writeCommit(table_dir, commit_version_++, filename, file_size, dynamic_schema);
+    DeltaLogWriter::writeCommit(fs_, table_dir, commit_version_++, filename, file_size, dynamic_schema);
     
     committed_lsn_val_.store(latest_lsn_);
     last_flushed_epoch_.store(epoch_id);

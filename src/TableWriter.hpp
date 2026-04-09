@@ -4,6 +4,7 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <parquet/arrow/writer.h>
+#include <arrow/filesystem/filesystem.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,9 +33,12 @@ public:
 private:
     TableInfo info_;
     std::string output_dir_;
+    std::shared_ptr<arrow::fs::FileSystem> fs_;
+    std::string base_path_;
     size_t file_counter_;
     size_t insert_count_;
     size_t update_count_;
+    size_t delete_count_;
     size_t row_group_size_;
     std::shared_ptr<arrow::Schema> schema_;
     std::vector<std::shared_ptr<arrow::ArrayBuilder>> builders_;

@@ -10,12 +10,14 @@ struct ColumnInfo {
     std::string name;
     std::string data_type;
     bool is_nullable;
+    bool pk_flag = false;
 };
 
 struct TableInfo {
     uint32_t rel_id;
     std::string schema;
     std::string table_name;
+    char repl_ident = 'd'; // d=default, n=nothing, f=full, i=index
     std::vector<ColumnInfo> columns;
 };
 

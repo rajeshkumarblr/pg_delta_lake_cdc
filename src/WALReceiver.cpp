@@ -107,10 +107,14 @@ void WALReceiver::fetchSchemas(PGconn *normal_conn) {
   std::cout << "Fetching schema definitions from PostgreSQL..." << std::endl;
   // We get columns for all tables in 'public' schema
   std::string query =
-      "SELECT table_schema, table_name, column_name, data_type, is_nullable "
-      "FROM information_schema.columns "
-      "WHERE table_schema = 'public' "
-      "ORDER BY table_name, ordinal_position;";
+      "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
+      "NOT a.attnotnull, COALESCE(i.indisprimary, false), c.relreplident "
+      "FROM pg_class c "
+      "JOIN pg_namespace n ON n.oid = c.relnamespace "
+      "JOIN pg_attribute a ON a.attrelid = c.oid "
+      "LEFT JOIN pg_index i ON i.indrelid = c.oid AND a.attnum = ANY(i.indkey) AND i.indisprimary "
+      "WHERE c.relkind = 'r' AND n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped "
+      "ORDER BY c.relname, a.attnum;";
 
   PGresult *res = PQexec(normal_conn, query.c_str());
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -128,22 +132,33 @@ void WALReceiver::fetchSchemas(PGconn *normal_conn) {
     std::string table = PQgetvalue(res, i, 1);
     std::string col_name = PQgetvalue(res, i, 2);
     std::string data_type = PQgetvalue(res, i, 3);
-    std::string is_nullable_str = PQgetvalue(res, i, 4);
+    bool is_nullable = (std::string(PQgetvalue(res, i, 4)) == "t");
+    bool is_pk = (std::string(PQgetvalue(res, i, 5)) == "t");
+    char repl_ident = PQgetvalue(res, i, 6)[0];
 
     if (table != current_table) {
       if (!current_table.empty()) {
+        // Warning check for Replica Identity
+        bool has_pk = false;
+        for (const auto& c : current_info.columns) if (c.pk_flag) has_pk = true;
+        if (!has_pk && current_info.repl_ident != 'f') {
+            std::cerr << "WARNING: Table [" << current_info.schema << "." << current_info.table_name 
+                      << "] has no Primary Key and REPLICA IDENTITY is not FULL. DELETE/UPDATE operations may fail to identify rows." << std::endl;
+        }
         registry_->addTable(current_info.schema, current_table, current_info);
       }
       current_table = table;
       current_info.schema = schema;
       current_info.table_name = table;
+      current_info.repl_ident = repl_ident;
       current_info.columns.clear();
     }
 
     ColumnInfo col;
     col.name = col_name;
     col.data_type = data_type;
-    col.is_nullable = (is_nullable_str == "YES");
+    col.is_nullable = is_nullable;
+    col.pk_flag = is_pk;
     current_info.columns.push_back(col);
   }
 
@@ -266,7 +281,7 @@ void WALReceiver::handleRelationMessage(char *payload, int length) {
   // Read replica identity (1 byte)
   if (offset + 1 > length)
     return;
-  offset++;
+  char stream_repl_ident = payload[offset++];
 
   // Read num_columns (2 bytes)
   if (offset + 2 > length)
@@ -283,6 +298,7 @@ void WALReceiver::handleRelationMessage(char *payload, int length) {
   stream_info.rel_id = rel_id;
   stream_info.schema = schema_name;
   stream_info.table_name = table_name;
+  stream_info.repl_ident = stream_repl_ident;
 
   parseRelationColumns(payload, length, offset, num_columns, stream_info,
                        fetched_info, has_catalog);
@@ -293,12 +309,11 @@ void WALReceiver::handleRelationMessage(char *payload, int length) {
 
   registry_->mapRelationId(rel_id, stream_info);
 
-  // Schema Evolution Detection: 
-  // If we already had this Relation ID and the column count changed, signal it.
+  // Schema Evolution Detection
   WalMessage schema_msg;
   schema_msg.relation_id = rel_id;
-  schema_msg.pg_msg_type = 'R'; // Relation metadata update
-  schema_msg.lsn = 0; // Not critical for this metadata
+  schema_msg.pg_msg_type = 'R';
+  schema_msg.lsn = 0;
   buffer_.push(schema_msg);
 }
 
@@ -310,7 +325,8 @@ void WALReceiver::parseRelationColumns(const char *payload, int length,
   for (uint16_t i = 0; i < num_columns; ++i) {
     if (offset + 1 > length)
       break;
-    offset += 1; // flags
+    uint8_t flags = payload[offset++];
+    bool is_key = (flags & 0x01);
 
     std::string col_name;
     while (offset < length && payload[offset] != '\0') {
@@ -324,12 +340,14 @@ void WALReceiver::parseRelationColumns(const char *payload, int length,
 
     std::string mapped_type = "text";
     bool is_nullable = true;
+    bool pk_flag = is_key;
 
     if (has_catalog) {
       for (const auto &fc : fetched_info.columns) {
         if (fc.name == col_name) {
           mapped_type = fc.data_type;
           is_nullable = fc.is_nullable;
+          if (is_key) pk_flag = true;
           break;
         }
       }
@@ -339,6 +357,7 @@ void WALReceiver::parseRelationColumns(const char *payload, int length,
     col.name = col_name;
     col.data_type = mapped_type;
     col.is_nullable = is_nullable;
+    col.pk_flag = pk_flag;
     info.columns.push_back(col);
   }
 }

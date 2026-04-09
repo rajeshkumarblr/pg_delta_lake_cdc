@@ -28,6 +28,8 @@ def generate_workload():
     
     # Clean up
     cur.execute("TRUNCATE TABLE integration_test;")
+    cur.execute("DROP TABLE IF EXISTS secondary_test;")
+    cur.execute("CREATE TABLE secondary_test (id SERIAL PRIMARY KEY, note TEXT, val INT);")
     conn.commit()
 
     # Insert 10,000 rows
@@ -91,21 +93,41 @@ def generate_workload():
         )
     conn.commit()
 
+    # 5. DELETE Test: Remove one of the evolved rows
+    print("Stage 3: Testing DELETE...")
+    cur.execute("DELETE FROM integration_test WHERE id = 96000;")
+    conn.commit()
+
+    # 6. UPDATE Test: Modify some scores
+    print("Stage 4: Testing UPDATE...")
+    cur.execute("UPDATE integration_test SET score = score + 100 WHERE id < 100;")
+    conn.commit()
+
+    # 7. Secondary Table Test
+    print("Stage 5: Testing Secondary Table...")
+    for i in range(10):
+        cur.execute("INSERT INTO secondary_test (note, val) VALUES (%s, %s)", (f"Note {i}", i * 10))
+    conn.commit()
+
     print("Workload complete. Waiting 15s for final CDC epoch...")
     time.sleep(15)
-    # Total Expected = 10000 (initial) + 5 (tx) + 5 (ev1) + 5 (ev2) = 10015
-    # Rollback rows (80000-80009) should NOT be counted.
-    expected_count = 10015
+    # Total Expected = 10000 (initial) + 5 (tx) + 5 (ev1) + 5 (ev2) - 1 (delete) = 10014
+    expected_count = 10014
     cur.execute("SELECT sum(score) FROM integration_test;")
     expected_sum = float(cur.fetchone()[0])
+
+    cur.execute("SELECT count(*) FROM secondary_test;")
+    secondary_count = int(cur.fetchone()[0])
     
     print(f"EXPECTED_COUNT={expected_count}")
     print(f"EXPECTED_SUM={expected_sum:.4f}")
+    print(f"SECONDARY_COUNT={secondary_count}")
     
     # Write to a file for verification step
     with open("/app/data/expected.txt", "w") as f:
         f.write(f"COUNT={expected_count}\n")
         f.write(f"SUM={expected_sum:.4f}\n")
+        f.write(f"SECONDARY_COUNT={secondary_count}\n")
 
     cur.close()
     conn.close()
