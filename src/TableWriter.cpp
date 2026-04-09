@@ -9,10 +9,9 @@
 TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir, 
                          std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
                          size_t row_group_size)
-    : info_(info), output_dir_(output_dir), file_counter_(0), insert_count_(0), update_count_(0), 
-      row_group_size_(row_group_size), current_rows_(0), commit_version_(0), latest_lsn_(0), 
-      global_committed_lsn_(committed_lsn), queue_(10000), keep_running_(false), 
-      committed_lsn_val_(0), last_flushed_epoch_(0), oldest_lsn_in_queue_(0) {
+    : info_(info), output_dir_(output_dir), global_committed_lsn_(committed_lsn), 
+      row_group_size_(row_group_size), file_counter_(1), current_rows_(0), 
+      keep_running_(false), oldest_lsn_in_queue_(0), pending_epoch_(0), queue_(10000) {
     setupSchemaAndBuilders();
 }
 
@@ -28,12 +27,13 @@ void TableWriter::start() {
 
 void TableWriter::stop() {
     if (!keep_running_) return;
-    keep_running_ = false;
     
     // Push a dummy message to wake up the worker if it's blocked on pop
     WalMessage dummy;
     dummy.relation_id = 0;
     queue_.push(dummy); 
+
+    keep_running_ = false;
 
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -41,14 +41,22 @@ void TableWriter::stop() {
 }
 
 void TableWriter::run() {
-    while (keep_running_) {
+    while (keep_running_ || !queue_.empty()) {
         WalMessage msg;
         if (queue_.pop_for(msg, std::chrono::milliseconds(100))) {
-            if (msg.relation_id == 0) continue; // Dummy message
+            // Process ALL messages until queue is empty
+            if (msg.relation_id == 0 && !keep_running_) continue; 
             
             // DEBUG LOGGING
             if (msg.is_flush_signal) {
-                std::cout << "TableWriter [" << info_.table_name << "]: Received flush signal for Epoch " << msg.epoch_id << std::endl;
+                std::cout << "TableWriter [" << info_.table_name << "]: Received flush signal for Epoch " << msg.epoch_id << " (Pending until next COMMIT)" << std::endl;
+                pending_epoch_ = msg.epoch_id;
+            } else if (msg.pg_msg_type == 'C') { // Commit
+                if (pending_epoch_ > 0) {
+                    std::cout << "TableWriter [" << info_.table_name << "]: COMMIT reached. Flushing Epoch " << pending_epoch_ << std::endl;
+                    flushPartition(pending_epoch_);
+                    pending_epoch_ = 0;
+                }
             }
             
             processInternal(msg);
@@ -98,9 +106,11 @@ void TableWriter::setupSchemaAndBuilders() {
     // Add metadata columns
     fields.push_back(arrow::field("_cdc_op", arrow::utf8(), false));
     fields.push_back(arrow::field("_cdc_timestamp", arrow::int64(), false));
+    fields.push_back(arrow::field("_cdc_lsn", arrow::uint64(), false));
     
     builders_.push_back(std::make_shared<arrow::StringBuilder>(pool)); // _cdc_op
     builders_.push_back(std::make_shared<arrow::Int64Builder>(pool));   // _cdc_timestamp
+    builders_.push_back(std::make_shared<arrow::UInt64Builder>(pool)); // _cdc_lsn
 
     schema_ = arrow::schema(fields);
     current_rows_ = 0;
@@ -117,11 +127,14 @@ void TableWriter::resetBuilders() {
     update_count_ = 0;
 }
 
-void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn) {
+void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn, char pg_msg_type) {
     WalMessage msg;
     msg.relation_id = info_.rel_id;
     msg.lsn = lsn;
-    msg.payload.assign(data, data + length);
+    msg.pg_msg_type = pg_msg_type;
+    if (data && length > 0) {
+        msg.payload.assign(data, data + length);
+    }
     
     {
         std::lock_guard<std::mutex> lock(lsn_mtx_);
@@ -150,9 +163,12 @@ uint64_t TableWriter::getOldestPendingLSN() const {
 }
 
 std::string TableWriter::generateDeltaSchemaJSON() {
-    std::string json = "{\"type\":\"struct\",\"fields\":[";
+    std::string columns_json = "";
     for (size_t i = 0; i < info_.columns.size(); ++i) {
         const auto& col = info_.columns[i];
+        if (col.name == "_cdc_op" || col.name == "_cdc_timestamp" || col.name == "_cdc_lsn") {
+            continue; // Skip metadata columns from PG
+        }
         std::string delta_type;
         const std::string& dt = col.data_type;
 
@@ -168,23 +184,24 @@ std::string TableWriter::generateDeltaSchemaJSON() {
             delta_type = "string";
         }
 
-        if (i > 0) json += ",";
-        json += "{\"name\":\"" + col.name + "\",\"type\":\"" + delta_type + "\",\"nullable\":" + (col.is_nullable ? "true" : "false") + ",\"metadata\":{}}";
+        if (i > 0) columns_json += ",";
+        columns_json += "{\"name\":\"" + col.name + "\",\"type\":\"" + delta_type + "\",\"nullable\":" + (col.is_nullable ? "true" : "false") + ",\"metadata\":{}}";
     }
 
     // Add CDC columns
-    json += ",{\"name\":\"_cdc_op\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}";
-    json += ",{\"name\":\"_cdc_timestamp\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}";
+    columns_json += ",{\"name\":\"_cdc_op\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}";
+    columns_json += ",{\"name\":\"_cdc_timestamp\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}";
+    columns_json += ",{\"name\":\"_cdc_lsn\",\"type\":\"long\",\"nullable\":false,\"metadata\":{}}";
     
-    json += "]}";
-    return json;
+    return "{\"type\":\"struct\",\"fields\":[" + columns_json + "]}";
 }
 
 void TableWriter::processInternal(const WalMessage& msg) {
-    if (msg.is_flush_signal) {
-        flushPartition(msg.epoch_id);
-        return;
+    if (msg.is_flush_signal || msg.pg_msg_type == 'B' || msg.pg_msg_type == 'C') {
+        return; 
     }
+    
+    // Original data processing logic...
 
     uint64_t lsn = msg.lsn;
     const char* data = msg.payload.data();
@@ -194,8 +211,6 @@ void TableWriter::processInternal(const WalMessage& msg) {
     {
         std::lock_guard<std::mutex> lock(lsn_mtx_);
         latest_lsn_ = lsn;
-        // In a real system, we'd need a more precise way to update oldest_lsn_in_queue_
-        // For now, this is a simplified PoC
     }
 
     if (length == 0) return;
@@ -236,7 +251,7 @@ void TableWriter::processInternal(const WalMessage& msg) {
     offset += 2;
     
     bool all_ok = true;
-    for (uint16_t col = 0; col < ncolumns && col < builders_.size() && offset < length; ++col) {
+    for (uint16_t col = 0; col < ncolumns && col < info_.columns.size() && offset < length; ++col) {
         char kind = data[offset++];
         auto& builder = builders_[col];
         
@@ -288,15 +303,23 @@ void TableWriter::processInternal(const WalMessage& msg) {
         }
     }
     
+    // PAD: If the message had fewer columns than we expect, append NULL to the remaining ones
+    for (size_t col = ncolumns; col < info_.columns.size(); ++col) {
+        if (!builders_[col]->AppendNull().ok()) all_ok = false;
+    }
+    
     if (all_ok) {
-        auto* op_builder = static_cast<arrow::StringBuilder*>(builders_[builders_.size() - 2].get());
-        auto* ts_builder = static_cast<arrow::Int64Builder*>(builders_[builders_.size() - 1].get());
+        size_t col_idx = info_.columns.size();
+        auto* op_builder = static_cast<arrow::StringBuilder*>(builders_[col_idx++].get());
+        auto* ts_builder = static_cast<arrow::Int64Builder*>(builders_[col_idx++].get());
+        auto* lsn_builder = static_cast<arrow::UInt64Builder*>(builders_[col_idx++].get());
         
         std::string op_str = (msg_type == 'I') ? "INSERT" : "UPDATE";
-        uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         
         if (!op_builder->Append(op_str).ok()) all_ok = false;
-        if (!ts_builder->Append(ms).ok()) all_ok = false;
+        if (!ts_builder->Append(us).ok()) all_ok = false;
+        if (!lsn_builder->Append(msg.lsn).ok()) all_ok = false;
     }
     
     if (all_ok) {
@@ -338,7 +361,7 @@ void TableWriter::flushPartition(uint64_t epoch_id) {
     if (epoch_id > 0) {
         filename = info_.table_name + "_epoch_" + std::to_string(epoch_id) + ".parquet";
     } else {
-        filename = info_.table_name + "_" + std::to_string(++file_counter_) + ".parquet";
+        filename = info_.table_name + "_" + std::to_string(latest_lsn_) + ".parquet";
     }
     std::string full_path = table_dir + "/" + filename;
     

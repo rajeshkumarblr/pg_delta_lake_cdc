@@ -4,6 +4,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <endian.h>
+#include <thread>
+#include <chrono>
 
 WALReceiver::WALReceiver(const std::string &conninfo,
                          BoundedBuffer<WalMessage> &buffer,
@@ -206,9 +208,23 @@ void WALReceiver::handleCopyData(char *msg, int length) {
       case 'R':
         handleRelationMessage(payload_start, wal_payload_len);
         break;
+      case 'B': // Begin
+      case 'C': // Commit
+        {
+          WalMessage tx_msg;
+          tx_msg.relation_id = 0; // Global
+          tx_msg.lsn = lsn;
+          tx_msg.pg_msg_type = pgoutput_msg_type;
+          tx_msg.payload.assign(payload_start, payload_start + wal_payload_len);
+          while (keep_running_ && !buffer_.push_for(std::move(tx_msg), std::chrono::milliseconds(1000))) {
+              sendStandbyStatusUpdate(committed_lsn_->load());
+          }
+        }
+        break;
       case 'I':
       case 'U':
       case 'D':
+      case 'T': // Truncate
         handleDataMessage(payload_start, wal_payload_len, lsn);
         break;
       default:
@@ -276,6 +292,14 @@ void WALReceiver::handleRelationMessage(char *payload, int length) {
             << " streaming replica columns)" << std::endl;
 
   registry_->mapRelationId(rel_id, stream_info);
+
+  // Schema Evolution Detection: 
+  // If we already had this Relation ID and the column count changed, signal it.
+  WalMessage schema_msg;
+  schema_msg.relation_id = rel_id;
+  schema_msg.pg_msg_type = 'R'; // Relation metadata update
+  schema_msg.lsn = 0; // Not critical for this metadata
+  buffer_.push(schema_msg);
 }
 
 void WALReceiver::parseRelationColumns(const char *payload, int length,
@@ -329,14 +353,19 @@ void WALReceiver::handleDataMessage(char *payload, int length, uint64_t lsn) {
 
   TableInfo info;
   if (registry_->getTableByRelationId(relation_id, info)) {
-    WalMessage wal_msg;
-    wal_msg.relation_id = relation_id;
-    wal_msg.lsn = lsn;
-    wal_msg.payload.assign(payload, payload + length);
+    WalMessage msg;
+    msg.relation_id = relation_id;
+    msg.lsn = lsn;
+    msg.pg_msg_type = payload[0]; // I, U, D
+    msg.payload.assign(payload, payload + length);
     
     // Heartbeat-aware backpressure
-    while (keep_running_ && !buffer_.push_for(std::move(wal_msg), std::chrono::milliseconds(1000))) {
+    // HEARTBEAT-AWARE BACKPRESSURE: 
+    // If the buffer is full, we must continue to send status updates to PG
+    // to prevent replication timeouts while we wait for the ParquetWriter to catch up.
+    while (keep_running_ && !buffer_.push_for(std::move(msg), std::chrono::milliseconds(1000))) {
         sendStandbyStatusUpdate(committed_lsn_->load());
+        if (PQstatus(conn_) != CONNECTION_OK) return; 
     }
   }
 }

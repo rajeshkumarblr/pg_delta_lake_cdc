@@ -1,0 +1,106 @@
+import duckdb
+import os
+import sys
+import time
+
+def verify():
+    print("Starting DuckDB Verification...")
+    
+    expected_file = "/app/data/expected.txt"
+    while not os.path.exists(expected_file):
+        print("Waiting for workload generator to finish...")
+        time.sleep(5)
+    
+    expected = {}
+    with open(expected_file, "r") as f:
+        for line in f:
+            key, val = line.strip().split("=")
+            expected[key] = float(val)
+
+    delta_path = "/app/data/integration_test"
+    
+    # Wait for Delta files to appear
+    retries = 20
+    while retries > 0:
+        if os.path.exists(os.path.join(delta_path, "_delta_log")):
+            break
+        print(f"Waiting for Delta table at {delta_path}...")
+        time.sleep(5)
+        retries -= 1
+
+    if retries == 0:
+        print("Delta table never appeared!")
+        sys.exit(1)
+
+    print("Waiting 30 seconds for final epochs to flush...")
+    time.sleep(30)
+
+    # Use DuckDB to read Parquet files directly
+    con = duckdb.connect()
+    
+    # 1. Integrity Check (Count and Sum)
+    # We read all parquet files in the table directory
+    parquet_pattern = os.path.join(delta_path, "*.parquet")
+    query = f"""
+        SELECT 
+            count(*) as cnt,
+            sum(score) as score_sum
+        FROM (
+            SELECT id, score, _cdc_lsn, _cdc_timestamp,
+                   row_number() OVER (PARTITION BY id ORDER BY _cdc_lsn DESC, _cdc_timestamp DESC) as rn
+            FROM read_parquet('{parquet_pattern}', union_by_name=True)
+        ) 
+        WHERE rn = 1
+    """
+    
+    stats = con.execute(query).fetchone()
+    actual_count = stats[0]
+    actual_sum = stats[1]
+
+    # 2. Rollback Verification (Negative Test)
+    # Rows 80000-80009 were rolled back in PG, so they should NOT be in Delta
+    rollback_check = con.execute(f"""
+        SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True)
+        WHERE id BETWEEN 80000 AND 80009
+    """).fetchone()[0]
+
+    # 3. Schema Evolution Verification
+    # Check if 'priority' and 'tags' columns exist and have expected values
+    schema_check = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{parquet_pattern}', union_by_name=True)").fetchall()
+    column_names = [r[0] for r in schema_check]
+    has_evolved_cols = "priority" in column_names and "tags" in column_names
+
+    print("-" * 40)
+    print("VERIFICATION RESULTS (DUCKDB)")
+    print(f"Expected Count: {expected['COUNT']}, Actual: {actual_count}")
+    print(f"Expected Sum:   {expected['SUM']:.4f}, Actual: {actual_sum:.4f}")
+    print(f"Rollback Check: {rollback_check} rows found (Expected: 0)")
+    print(f"Schema Evolution: {'SUCCESS' if has_evolved_cols else 'FAILED'} (Columns: {', '.join(column_names)})")
+    print("-" * 40)
+
+    success = True
+    if actual_count != int(expected['COUNT']):
+        print("FAIL: Row count mismatch!")
+        success = False
+    
+    if abs(float(actual_sum) - expected['SUM']) > 0.1:
+        print("FAIL: Aggregate sum mismatch!")
+        success = False
+
+    if rollback_check != 0:
+        print(f"FAIL: {rollback_check} rollback rows leaked into Delta!")
+        success = False
+
+    if not has_evolved_cols:
+        print("FAIL: Evolved columns (priority/tags) missing!")
+        success = False
+
+    if success:
+        print("SUCCESS: CDC Engine passed Transaction and Schema Evolution tests!")
+        with open("/app/data/test_passed.txt", "w") as f:
+            f.write("PASSED")
+    else:
+        sys.exit(1)
+
+if __name__ == "__main__":
+    verify()

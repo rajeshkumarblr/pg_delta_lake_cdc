@@ -31,12 +31,22 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS integration_test (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    score DOUBLE PRECISION,
+    is_active BOOLEAN,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- CDC Setup
--- Create publication for all tables (or just stories for now as per daemon config)
+-- Create publication for all tables
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'hn_stories_pub') THEN
-        CREATE PUBLICATION hn_stories_pub FOR TABLE stories, comments;
+        CREATE PUBLICATION hn_stories_pub FOR ALL TABLES;
+    ELSE
+        ALTER PUBLICATION hn_stories_pub ADD TABLE stories, comments, users, integration_test;
     END IF;
 END $$;
 

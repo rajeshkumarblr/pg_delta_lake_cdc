@@ -234,14 +234,17 @@ The `BoundedBuffer` is the primary decoupling mechanism between the producer (ne
 The `TableWriter` is now a fully asynchronous worker that manages processing for a specific table in its own thread.
 - **Design**: Each `TableWriter` maintains its own `BoundedBuffer` of WAL messages. This allows a slow table (due to large schema or high write volume) to buffer independently without blocking other tables.
 - **Async Execution**: It converts PostgreSQL binary tuples into Apache Arrow format via a background `run()` loop.
+- **Transaction Atomicity**: Implements `BEGIN`/`COMMIT` tracking. Rows are buffered in internal Arrow builders and only flushed to Parquet upon receiving a `COMMIT` signal. Rolled-back transactions are automatically discarded by resetting builders, ensuring ACID compliance at the storage layer.
+- **Schema Evolution Support**: When a schema change is detected, the `TableWriter` is gracefully restarted with the new column layout. It uses a robust **NULL-padding** strategy to handle messages that may still be using the previous metadata during the transition window.
 - **Dynamic Schema**: Generates the Delta Lake JSON schema dynamically from PostgreSQL metadata on every partition flush.
 - **LSN Tracking**: It tracks both the latest LSN pushed to its queue and the latest LSN successfully committed to Delta Lake.
 - **Atomicity**: The write operation remains atomic: Parquet flush followed by Delta Log commit.
 
-### 4. ParquetWriter (Dispatcher & LSN Aggregator)
-The `ParquetWriter` has evolved from a simple writer into a high-speed dispatcher.
+### 4. ParquetWriter (Coordinator & LSN Aggregator)
+The `ParquetWriter` acts as the central coordinator for the parallel pipeline.
 - **Global Epoch Coordination**: Implements cross-table ACID consistency by triggering global "epochs".
-- **Barrier Synchronization**: Periodically broadcasts flush signals to all active `TableWriter` threads and waits for them to acknowledge completion before advancing the global replication LSN.
+- **Barrier Synchronization**: Periodically broadcasts flush signals to all active `TableWriter` threads.
+- **Non-blocking State Machine**: Uses a non-blocking synchronization loop that allows the engine to continue processing WAL messages while waiting for epoch confirmation, ensuring that replication heartbeats are never interrupted.
 - **Min-LSN Safety Mechanism**: Ensures that the global replication slot only advances to the minimum LSN successfully committed across all parallel tables, preventing data loss on restarts.
 
 ### 5. DeltaLogWriter

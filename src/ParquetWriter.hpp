@@ -33,6 +33,8 @@ private:
     std::unordered_map<uint32_t, std::unique_ptr<TableWriter>> writers_;
     uint64_t current_epoch_id_ = 1;
     uint64_t current_max_lsn_ = 0;
+    uint64_t pending_epoch_id_ = 0;
+    uint64_t pending_epoch_lsn_ = 0;
 
     void run();
     void processMessage(const WalMessage& msg);

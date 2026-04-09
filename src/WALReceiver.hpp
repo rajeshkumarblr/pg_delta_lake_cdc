@@ -14,6 +14,7 @@ struct WalMessage {
   std::vector<char> payload;
   bool is_flush_signal = false;
   uint64_t epoch_id = 0;
+  char pg_msg_type = '\0'; // 'B' for Begin, 'C' for Commit, 'I/U/D' for data
 };
 
 class WALReceiver {

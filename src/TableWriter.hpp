@@ -18,7 +18,7 @@ public:
                 size_t row_group_size = 100);
     ~TableWriter();
 
-    void appendRow(const char* tuple_data, size_t length, uint64_t lsn);
+    void appendRow(const char* tuple_data, size_t length, uint64_t lsn, char pg_msg_type);
     void sendFlushSignal(uint64_t epoch_id);
     void flushPartition(uint64_t epoch_id);
     void start();
@@ -51,6 +51,7 @@ private:
     std::atomic<uint64_t> last_flushed_epoch_;
     mutable std::mutex lsn_mtx_;
     uint64_t oldest_lsn_in_queue_;
+    uint64_t pending_epoch_;
 
     void setupSchemaAndBuilders();
     void resetBuilders();

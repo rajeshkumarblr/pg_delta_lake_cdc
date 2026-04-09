@@ -45,5 +45,26 @@ services:
       postgres:
         condition: service_healthy
 
+  workload-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.workload
+    environment:
+      DATABASE_URL: postgresql://hn_user:my_hn_pass%241234%23@postgres:5432/my_hn?sslmode=disable
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cdc-daemon:
+        condition: service_started
+
+  duckdb-verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.duckdb
+    volumes:
+      - ./data:/app/data
+
 volumes:
   postgres_data:

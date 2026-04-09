@@ -44,39 +44,54 @@ void ParquetWriter::run() {
         if (rows_since_epoch >= 50000 || 
             (rows_since_epoch > 0 && std::chrono::duration_cast<std::chrono::seconds>(now - last_epoch_tick).count() >= 10)) {
             
-            uint64_t epoch_lsn = current_max_lsn_;
-            uint64_t epoch_id = current_epoch_id_++;
-            
-            std::cout << "ParquetWriter: Triggering Epoch " << epoch_id << " at LSN " << epoch_lsn << std::endl;
-            broadcastFlushSignal(epoch_id);
-            
-            // Wait for all writers to commit this epoch's data
-            bool all_ready = false;
-            while (!all_ready && keep_running_) {
-                all_ready = true;
-                for (auto& pair : writers_) {
-                    if (pair.second->getLastFlushedEpoch() < epoch_id) {
-                        // std::cout << "ParquetWriter: Still waiting for Table [" << pair.first << "] (Last Flushed: " << pair.second->getLastFlushedEpoch() << " < Current: " << epoch_id << ")" << std::endl;
-                        all_ready = false;
-                        break;
-                    }
+            if (pending_epoch_id_ == 0) { // Only trigger if no epoch is currently waiting
+                pending_epoch_id_ = current_epoch_id_++;
+                pending_epoch_lsn_ = current_max_lsn_;
+                
+                std::cout << "ParquetWriter: Triggering Epoch " << pending_epoch_id_ << " at LSN " << pending_epoch_lsn_ << std::endl;
+                broadcastFlushSignal(pending_epoch_id_);
+            }
+        }
+
+        // Asynchronously check if the pending epoch is completed by all writers
+        if (pending_epoch_id_ > 0) {
+            bool all_ready = true;
+            for (auto& pair : writers_) {
+                if (pair.second->getLastFlushedEpoch() < pending_epoch_id_) {
+                    all_ready = false;
+                    break;
                 }
-                if (!all_ready) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            
-            if (keep_running_) {
-                committed_lsn_->store(epoch_lsn);
-                std::cout << "ParquetWriter: Epoch " << epoch_id << " committed. Global LSN: " << epoch_lsn << std::endl;
+
+            if (all_ready) {
+                committed_lsn_->store(pending_epoch_lsn_);
+                std::cout << "ParquetWriter: Epoch " << pending_epoch_id_ << " committed. Global LSN: " << pending_epoch_lsn_ << std::endl;
+                pending_epoch_id_ = 0;
+                rows_since_epoch = 0;
+                last_epoch_tick = std::chrono::steady_clock::now();
             }
-            
-            rows_since_epoch = 0;
-            last_epoch_tick = std::chrono::steady_clock::now();
         }
     }
     stopAllWriters();
 }
 
 void ParquetWriter::processMessage(const WalMessage& msg) {
+    if (msg.pg_msg_type == 'B' || msg.pg_msg_type == 'C') {
+        for (auto& pair : writers_) {
+            pair.second->appendRow(nullptr, 0, msg.lsn, msg.pg_msg_type);
+        }
+        return;
+    }
+
+    if (msg.pg_msg_type == 'R') {
+        std::cout << "ParquetWriter: Detected Schema Change for Relation " << msg.relation_id << ". Re-initializing worker..." << std::endl;
+        auto it = writers_.find(msg.relation_id);
+        if (it != writers_.end()) {
+            it->second->stop();
+            writers_.erase(it);
+        }
+        return;
+    }
     auto it = writers_.find(msg.relation_id);
     if (it == writers_.end()) {
         TableInfo info;
@@ -89,7 +104,7 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
             return;
         }
     }
-    it->second->appendRow(msg.payload.data(), msg.payload.size(), msg.lsn);
+    it->second->appendRow(msg.payload.data(), msg.payload.size(), msg.lsn, msg.pg_msg_type);
 }
 
 void ParquetWriter::broadcastFlushSignal(uint64_t epoch_id) {
