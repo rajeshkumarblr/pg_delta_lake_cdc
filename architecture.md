@@ -87,18 +87,21 @@ classDiagram
 
     class TableWriter {
         -TableInfo info
+        -shared_ptr~FileSystem~ fs_
+        -string base_path_
         -BoundedBuffer~WalMessage~ queue
         -thread worker_thread
         -atomic~uint64_t~ committed_lsn_val
-        -atomic~uint64_t~ last_flushed_epoch
-        -uint64_t latest_lsn
+        -uint64_t insert_count_
+        -uint64_t update_count_
+        -uint64_t delete_count_
         +start()
         +stop()
         +appendRow()
         +sendFlushSignal(epoch_id)
-        +getLastFlushedEpoch()
         -run()
         -processInternal()
+        -flushPartition(epoch_id)
         -generateDeltaSchemaJSON()
     }
 
@@ -112,8 +115,7 @@ classDiagram
 
     class DeltaLogWriter {
         <<static>>
-        +writeCommit()
-        -escapeJson()
+        +writeCommit(fs, directory, version, ...)
     }
 
     class TableRegistry {
@@ -167,24 +169,24 @@ sequenceDiagram
 
     loop CDC Loop
         PG->>WR: CopyData (WAL Message)
-        Note over WR: Non-blocking IO + Heartbeats
+        Note over WR: Capture repl_ident + pk_flag
         WR->>BB: push_for(WalMessage, timeout)
         
         Note over PW: Coordinator
         BB->>PW: Drain available messages
         PW->>TW: dispatch to queue
         
-        opt Epoch Trigger (10s or 50k rows)
+        opt Epoch Trigger (Batch or Commit)
             PW->>TW: sendFlushSignal(epoch_id)
-            Note over TW: Worker sync phase
+            Note over TW: Parallel worker flush
             TW->>TW: flushPartition(epoch_id)
-            TW->>DL: writeCommit(dynamic_schema)
+            TW->>DL: writeCommit(fs_, dynamic_schema)
             TW->>TW: Update last_flushed_epoch
             PW->>TW: Check getLastFlushedEpoch()
             PW->>PW: Advance global committed_lsn
         end
         
-        Note over WR: Independent Heartbeat
+        Note over WR: Independent Status Loop
         opt Periodic Heartbeat (5s)
             WR->>PG: StandbyStatusUpdate(global_lsn)
         end
