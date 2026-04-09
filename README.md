@@ -12,7 +12,9 @@ graph LR
 ```
 
 ## Overview
-This pipeline captures real-time database changes (WAL) utilizing PostgreSQL's native `pgoutput` plugin, pivots them into optimized Apache Arrow/Parquet layouts, and incrementally merges them into a refined Silver layer for analytics.
+This pipeline captures real-time database changes (WAL) utilizing PostgreSQL's native `pgoutput` plugin, pivots them into optimized Apache Arrow/Parquet layouts via a **parallel multi-threaded C++ engine**, and incrementally merges them into a refined Silver layer for analytics.
+
+For a detailed breakdown of the internal threading model, LSN safety mechanisms, and sequence diagrams, refer to the [Full Architecture Documentation](architecture.md).
 
 ### Feature Highlights
 - **Production-Ready CDC (100% Data Integrity)**: Verified against a 10,016-row stress test covering complex transaction boundaries, schema changes, and multi-table synchronization.
@@ -32,7 +34,13 @@ The system is designed to support a **Medallion Architecture** out of the box:
 - **Bronze Layer**: Raw, immutable CDC event stream (Inserts/Updates) written by the C++ daemon into the Delta table.
 - **Silver Layer**: A deduplicated, "latest state" view of the data, reconstructed by downstream consumers (like Spark) using the `_cdc_timestamp` metadata.
 
-For more detailed architecture notes, see [architecture.md](architecture.md).
+### Parallel CDC Pipeline Architecture
+The CDC Daemon is built for high-throughput environments using a sophisticated producer-consumer model:
+- **`WALReceiver`**: Dedicated network thread for non-blocking PostgreSQL streaming.
+- **`ParquetWriter`**: Central coordinator managing global epochs and LSN consistency.
+- **`TableWriter` Workers**: Per-table asynchronous threads with independent bounded queues, enabling parallel processing of partitioned data and resilience to individual table backpressure.
+
+See [architecture.md](architecture.md#component-details) for more on the component implementation.
 ### 1. Start the Stack (Postgres + CDC)
 ```bash
 cd test
