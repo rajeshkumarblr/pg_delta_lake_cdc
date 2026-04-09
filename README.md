@@ -31,8 +31,13 @@ For a deep dive into the internals and sequence diagrams, see [architecture.md](
 
 ## Medallion Architecture Support
 The system is designed to support a **Medallion Architecture** out of the box:
-- **Bronze Layer**: Raw, immutable CDC event stream (Inserts/Updates) written by the C++ daemon into the Delta table.
-- **Silver Layer**: A deduplicated, "latest state" view of the data, reconstructed by downstream consumers (like Spark) using the `_cdc_timestamp` metadata.
+- **Bronze Layer**: Raw, immutable CDC event stream (Inserts/Updates/Deletes) written by the C++ daemon into the Delta table.
+- **Silver Layer**: A deduplicated, "latest state" view of the data, reconstructed by downstream consumers (like Spark or Databricks) using the `_cdc_timestamp` and `_cdc_lsn` metadata.
+
+### ☁️ Zero-ETL for Azure Databricks (Cloud Scale)
+The `pg_delta_lake_cdc` engine is designed to enable a modern "Zero-ETL" experience on **Azure Databricks**. By streaming PostgreSQL changes directly to ADLS Gen2, engineers can bypass traditional ETL overhead and achieve real-time synchronization with heavy-duty analytics clusters.
+
+See the [Azure Databricks Sample](samples/databricks/README.md) for a complete guide on setting up this flow with ADLS Gen2 and Spark materialization.
 
 ### Parallel CDC Pipeline Architecture
 The CDC Daemon is built for high-throughput environments using a sophisticated producer-consumer model:
