@@ -16,7 +16,8 @@ class TableWriter {
 public:
     TableWriter(const TableInfo& info, const std::string& output_dir, 
                 std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
-                size_t row_group_size = 100);
+                size_t row_group_size = 100,
+                uint64_t watermark_lsn = 0);
     ~TableWriter();
 
     void appendRow(const char* tuple_data, size_t length, uint64_t lsn, char pg_msg_type);
@@ -29,6 +30,8 @@ public:
     uint64_t getOldestPendingLSN() const;
     uint64_t getLastCommittedLSN() const { return committed_lsn_val_.load(); }
     uint64_t getLastFlushedEpoch() const { return last_flushed_epoch_.load(); }
+    
+    void processSnapshotCopy(const char* data, size_t length);
 
 private:
     TableInfo info_;
@@ -45,6 +48,7 @@ private:
     size_t current_rows_;
     int commit_version_;
     uint64_t latest_lsn_;
+    uint64_t watermark_lsn_;
     std::shared_ptr<std::atomic<uint64_t>> global_committed_lsn_;
     
     // Threading and Queueing

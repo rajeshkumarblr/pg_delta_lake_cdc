@@ -21,11 +21,20 @@ class WALReceiver {
 public:
   WALReceiver(const std::string &conninfo, BoundedBuffer<WalMessage> &buffer,
               std::shared_ptr<TableRegistry> registry,
-              std::shared_ptr<std::atomic<uint64_t>> committed_lsn);
+              std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
+              bool snapshot_mode = false);
   ~WALReceiver();
 
   void run();
   void stop();
+  
+  std::string getSnapshotId() const { return snapshot_id_; }
+  uint64_t getWatermarkLsn() const { return watermark_lsn_; }
+  void performSnapshot();
+
+  void connect();
+  void startLogicalReplication();
+  void receiveLoop();
 
 private:
   std::string conninfo_;
@@ -34,11 +43,11 @@ private:
   std::shared_ptr<std::atomic<uint64_t>> committed_lsn_;
   PGconn *conn_;
   std::atomic<bool> keep_running_;
+  bool snapshot_mode_;
+  std::string snapshot_id_;
+  uint64_t watermark_lsn_ = 0;
 
-  void connect();
   void fetchSchemas(PGconn *normal_conn);
-  void startLogicalReplication();
-  void receiveLoop();
   void handleCopyData(char *msg, int length);
   void handleRelationMessage(char *payload, int length);
   void handleDataMessage(char *payload, int length, uint64_t lsn);

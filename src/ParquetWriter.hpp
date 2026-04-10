@@ -16,7 +16,7 @@ class ParquetWriter {
 public:
     ParquetWriter(BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry, 
                   const std::string& output_dir, std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
-                  size_t row_group_size = 100);
+                  size_t row_group_size = 100, uint64_t watermark_lsn = 0);
     ~ParquetWriter();
 
     void start();
@@ -35,6 +35,7 @@ private:
     uint64_t current_max_lsn_ = 0;
     uint64_t pending_epoch_id_ = 0;
     uint64_t pending_epoch_lsn_ = 0;
+    uint64_t watermark_lsn_ = 0;
 
     void run();
     void processMessage(const WalMessage& msg);

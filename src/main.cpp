@@ -78,15 +78,31 @@ int main(int argc, char *argv[]) {
     auto committed_lsn = std::make_shared<std::atomic<uint64_t>>(0);
     BoundedBuffer<WalMessage> buffer(10000);
 
-    ParquetWriter writer(buffer, registry, output_dir, committed_lsn, 100);
+    const char* env_snapshot = std::getenv("SNAPSHOT_MODE");
+    bool snapshot_mode = env_snapshot && (std::string(env_snapshot) == "true" || std::string(env_snapshot) == "1");
 
+    WALReceiver receiver(conninfo, buffer, registry, committed_lsn, snapshot_mode);
+    g_receiver = &receiver;
+    
+    receiver.connect();
+    
+    uint64_t watermark_lsn = 0;
+    if (snapshot_mode) {
+        receiver.startLogicalReplication();
+        watermark_lsn = receiver.getWatermarkLsn();
+    }
+
+    ParquetWriter writer(buffer, registry, output_dir, committed_lsn, 100, watermark_lsn);
     g_writer = &writer;
     writer.start();
 
-    WALReceiver receiver(conninfo, buffer, registry, committed_lsn);
+    if (snapshot_mode) {
+        receiver.performSnapshot();
+    } else {
+        receiver.startLogicalReplication();
+    }
 
-    g_receiver = &receiver;
-    receiver.run();
+    receiver.receiveLoop();
 
     std::cout << "Receiver run-loop exited. Stopping writer..." << std::endl;
     writer.stop();

@@ -4,9 +4,10 @@
 
 ParquetWriter::ParquetWriter(BoundedBuffer<WalMessage>& buffer, std::shared_ptr<TableRegistry> registry, 
                              const std::string& output_dir, std::shared_ptr<std::atomic<uint64_t>> committed_lsn, 
-                             size_t row_group_size)
+                             size_t row_group_size, uint64_t watermark_lsn)
     : buffer_(buffer), registry_(std::move(registry)), output_dir_(output_dir), 
-      row_group_size_(row_group_size), keep_running_(false), committed_lsn_(committed_lsn) {
+      row_group_size_(row_group_size), keep_running_(false), committed_lsn_(committed_lsn),
+      watermark_lsn_(watermark_lsn) {
 }
 
 ParquetWriter::~ParquetWriter() {
@@ -96,7 +97,7 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
     if (it == writers_.end()) {
         TableInfo info;
         if (registry_->getTableByRelationId(msg.relation_id, info)) {
-            auto writer = std::make_unique<TableWriter>(info, output_dir_, committed_lsn_, row_group_size_);
+            auto writer = std::make_unique<TableWriter>(info, output_dir_, committed_lsn_, row_group_size_, watermark_lsn_);
             writer->start();
             writers_[msg.relation_id] = std::move(writer);
             it = writers_.find(msg.relation_id);

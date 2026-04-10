@@ -6,13 +6,16 @@
 #include <endian.h>
 #include <thread>
 #include <chrono>
+#include <cstdio>
 
 WALReceiver::WALReceiver(const std::string &conninfo,
                          BoundedBuffer<WalMessage> &buffer,
                          std::shared_ptr<TableRegistry> registry,
-                         std::shared_ptr<std::atomic<uint64_t>> committed_lsn)
+                         std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
+                         bool snapshot_mode)
     : conninfo_(conninfo), buffer_(buffer), registry_(std::move(registry)),
-      committed_lsn_(committed_lsn), conn_(nullptr), keep_running_(true) {}
+      committed_lsn_(committed_lsn), conn_(nullptr), keep_running_(true),
+      snapshot_mode_(snapshot_mode) {}
 
 WALReceiver::~WALReceiver() {
   stop();
@@ -175,13 +178,48 @@ void WALReceiver::startLogicalReplication() {
   const char *env_slot = std::getenv("PG_SLOT_NAME");
   const char *env_pub = std::getenv("PG_PUBLICATION_NAME");
 
-  std::string slot_name = env_slot ? env_slot : "cdc_stream_slot";
-  std::string pub_name = env_pub ? env_pub : "cdc_test_stream";
+  std::string slot_name = env_slot ? env_slot : "hn_stories_slot";
+  std::string pub_name = env_pub ? env_pub : "hn_stories_pub";
 
-  std::string query = "START_REPLICATION SLOT \"" + slot_name +
+  // Check if slot exists, if not create it and export snapshot
+  std::string check_query = "SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slot_name + "';";
+  
+  // Note: We need a temporary normal connection to check/create slot if we want to use SQL,
+  // OR we use the replication connection with replication commands.
+  // Replication connection supports CREATE_REPLICATION_SLOT.
+  
+  std::string create_query = "CREATE_REPLICATION_SLOT \"" + slot_name + "\" LOGICAL pgoutput EXPORT_SNAPSHOT;";
+  PGresult *res = PQexec(conn_, create_query.c_str());
+  
+  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+      watermark_lsn_ = 0;
+      std::string lsn_str = PQgetvalue(res, 0, 1);
+      snapshot_id_ = PQgetvalue(res, 0, 2);
+      
+      uint32_t high, low;
+      if (sscanf(lsn_str.c_str(), "%X/%X", &high, &low) == 2) {
+          watermark_lsn_ = ((uint64_t)high << 32) | low;
+      }
+      
+      std::cout << "Created replication slot '" << slot_name << "'. Consistent point: " << lsn_str 
+                << ", Snapshot ID: " << snapshot_id_ << std::endl;
+  } else {
+      // Slot probably exists. We need the consistent point from elsewhere or assume it's current.
+      // For a fresh Snapshot-then-CDC, the slot SHOULD be created now.
+      std::string err = PQerrorMessage(conn_);
+      if (err.find("already exists") != std::string::npos) {
+          std::cout << "Replication slot '" << slot_name << "' already exists. Continuing without fresh snapshot." << std::endl;
+      } else {
+          PQclear(res);
+          throw std::runtime_error("Could not create replication slot: " + err);
+      }
+  }
+  PQclear(res);
+
+  std::string start_query = "START_REPLICATION SLOT \"" + slot_name +
                       "\" LOGICAL 0/0 (proto_version '1', publication_names '" +
                       pub_name + "');";
-  PGresult *res = PQexec(conn_, query.c_str());
+  res = PQexec(conn_, start_query.c_str());
 
   if (PQresultStatus(res) != PGRES_COPY_BOTH) {
     std::string err = PQerrorMessage(conn_);
@@ -193,6 +231,67 @@ void WALReceiver::startLogicalReplication() {
             << "'." << std::endl;
 }
 
+
+void WALReceiver::performSnapshot() {
+    if (snapshot_id_.empty()) {
+        std::cout << "No snapshot ID available. Skipping snapshot phase." << std::endl;
+        return;
+    }
+
+    std::cout << "Starting coordinated snapshot from consistent point: " << watermark_lsn_ << std::endl;
+
+    PGconn *snap_conn = PQconnectdb(conninfo_.c_str());
+    if (PQstatus(snap_conn) != CONNECTION_OK) {
+        std::string err = PQerrorMessage(snap_conn);
+        PQfinish(snap_conn);
+        throw std::runtime_error("Snapshot connection failed: " + err);
+    }
+
+    PQexec(snap_conn, "BEGIN ISOLATION LEVEL REPEATABLE READ;");
+    std::string set_snap = "SET TRANSACTION SNAPSHOT '" + snapshot_id_ + "';";
+    PGresult *res = PQexec(snap_conn, set_snap.c_str());
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        std::string err = PQerrorMessage(snap_conn);
+        PQclear(res);
+        PQfinish(snap_conn);
+        throw std::runtime_error("Failed to set transaction snapshot: " + err);
+    }
+    PQclear(res);
+
+    auto all_tables = registry_->getAllTables();
+    for (const auto& table : all_tables) {
+        std::cout << "Performing snapshot for table: " << table.schema << "." << table.table_name << std::endl;
+        
+        std::string copy_query = "COPY (SELECT * FROM " + table.schema + "." + table.table_name + ") TO STDOUT WITH (FORMAT binary);";
+        res = PQexec(snap_conn, copy_query.c_str());
+        if (PQresultStatus(res) != PGRES_COPY_OUT) {
+            std::cerr << "Failed to start binary COPY for " << table.table_name << ": " << PQerrorMessage(snap_conn) << std::endl;
+            PQclear(res);
+            continue;
+        }
+        PQclear(res);
+
+        char *buffer = nullptr;
+        int ret;
+        while ((ret = PQgetCopyData(snap_conn, &buffer, 0)) > 0) {
+            WalMessage msg;
+            msg.relation_id = table.rel_id;
+            msg.lsn = watermark_lsn_;
+            msg.pg_msg_type = 'S'; // Snapshot data
+            msg.payload.assign(buffer, buffer + ret);
+            buffer_.push(msg);
+            PQfreemem(buffer);
+        }
+
+        if (ret == -2) {
+            std::cerr << "Error reading COPY data for " << table.table_name << ": " << PQerrorMessage(snap_conn) << std::endl;
+        }
+    }
+
+    PQexec(snap_conn, "COMMIT;");
+    PQfinish(snap_conn);
+    std::cout << "Snapshot phase completed successfully." << std::endl;
+}
 
 void WALReceiver::handleCopyData(char *msg, int length) {
   if (length == 0)

@@ -53,6 +53,14 @@ public:
         return false;
     }
 
+    std::vector<TableInfo> getAllTables() const {
+        std::vector<TableInfo> result;
+        for (const auto& [name, info] : tables_) {
+            result.push_back(info);
+        }
+        return result;
+    }
+    
 private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, TableInfo> tables_; 
