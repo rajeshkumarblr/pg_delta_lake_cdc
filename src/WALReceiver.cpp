@@ -11,11 +11,9 @@
 WALReceiver::WALReceiver(const std::string &conninfo,
                          BoundedBuffer<WalMessage> &buffer,
                          std::shared_ptr<TableRegistry> registry,
-                         std::shared_ptr<std::atomic<uint64_t>> committed_lsn,
-                         bool snapshot_mode)
+                         std::shared_ptr<std::atomic<uint64_t>> committed_lsn)
     : conninfo_(conninfo), buffer_(buffer), registry_(std::move(registry)),
-      committed_lsn_(committed_lsn), conn_(nullptr), keep_running_(true),
-      snapshot_mode_(snapshot_mode) {}
+      committed_lsn_(committed_lsn), conn_(nullptr), keep_running_(true) {}
 
 WALReceiver::~WALReceiver() {
   stop();
