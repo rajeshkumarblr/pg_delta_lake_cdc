@@ -26,8 +26,7 @@ def generate_workload():
 
     cur = conn.cursor()
     
-    # Clean up
-    cur.execute("TRUNCATE TABLE integration_test;")
+    # Clean up (but don't truncate seeded data)
     cur.execute("DROP TABLE IF EXISTS secondary_test;")
     cur.execute("CREATE TABLE secondary_test (id SERIAL PRIMARY KEY, note TEXT, val INT);")
     conn.commit()

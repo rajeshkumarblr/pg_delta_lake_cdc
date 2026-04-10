@@ -72,7 +72,10 @@ def verify():
     
     # 5. Check for DELETE operations (Bronze layer)
     res_delete = con.execute(f"SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True) WHERE _cdc_op = 'DELETE'").fetchone()[0]
-    print(f"Delete Records in Bronze: {res_delete} (Expected: 1)")
+    
+    # 7. Snapshot Verification
+    res_snapshot = con.execute(f"SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True) WHERE _cdc_op = 'SNAPSHOT'").fetchone()[0]
+    print(f"Snapshot Records (Historical): {res_snapshot} (Expected: 100)")
 
     # 6. Secondary Table Verification
     secondary_path = "/app/data/secondary_test/*.parquet"
@@ -87,6 +90,7 @@ def verify():
     print(f"Expected Count (Sec):  {expected['SECONDARY_COUNT']}, Actual: {res_secondary}")
     print(f"Rollback Check: {rollback_check} rows found (Expected: 0)")
     print(f"Delete Check:   {res_delete} rows found (Expected: 1)")
+    print(f"Snapshot Check: {res_snapshot} rows found (Expected: 100)")
     print(f"Schema Evolution: {'SUCCESS' if has_evolved_cols else 'FAILED'} (Columns: {', '.join(column_names)})")
     print("-" * 40)
 
@@ -105,6 +109,10 @@ def verify():
 
     if rollback_check != 0:
         print(f"FAIL: {rollback_check} rollback rows leaked into Delta!")
+        success = False
+
+    if res_snapshot < 100:
+        print(f"FAIL: Snapshot missing or incomplete! Expected 100, got {res_snapshot}")
         success = False
 
     if not has_evolved_cols:

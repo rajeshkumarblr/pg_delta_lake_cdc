@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS integration_test (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Seed Historical Data (will be captured via SNAPSHOT)
+INSERT INTO integration_test (name, score, is_active)
+SELECT 'Historical_' || i, i * 1.5, true
+FROM generate_series(1, 100) s(i);
+
 -- CDC Setup
 -- Create publication for all tables
 DO $$
@@ -50,9 +55,4 @@ BEGIN
     END IF;
 END $$;
 
--- Create replication slot (Logical)
--- Note: In PG16, we can use pg_create_logical_replication_slot
-SELECT pg_create_logical_replication_slot('hn_stories_slot', 'pgoutput')
-WHERE NOT EXISTS (
-    SELECT 1 FROM pg_replication_slots WHERE slot_name = 'hn_stories_slot'
-);
+-- Replication slot will be created by cdc-daemon using EXPORT_SNAPSHOT
