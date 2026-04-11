@@ -146,6 +146,9 @@ void TableWriter::setupSchemaAndBuilders() {
         } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
             arrow_type = arrow::int64();
             builder = std::make_shared<arrow::Int64Builder>(pool);
+        } else if (dt == "timestamp with time zone" || dt == "timestamp" || dt == "timestamptz") {
+            arrow_type = arrow::timestamp(arrow::TimeUnit::MICRO);
+            builder = std::make_shared<arrow::TimestampBuilder>(arrow_type, pool);
         } else if (dt == "real" || dt == "float4") {
             arrow_type = arrow::float32();
             builder = std::make_shared<arrow::FloatBuilder>(pool);
@@ -517,6 +520,13 @@ void TableWriter::processSnapshotCopy(const char* data, size_t length) {
                 std::memcpy(&val_n, col_data, 8);
                 status = b->Append(be64toh(val_n));
             } else { status = b->AppendNull(); }
+        } else if (dt == "timestamp with time zone" || dt == "timestamp" || dt == "timestamptz") {
+            auto* b = static_cast<arrow::TimestampBuilder*>(builder.get());
+            if (col_len == 8) {
+                uint64_t val_n;
+                std::memcpy(&val_n, col_data, 8);
+                status = b->Append(be64toh(val_n));
+            } else { status = b->AppendNull(); }
         } else if (dt == "real" || dt == "float4") {
             auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
             if (col_len == 4) {
@@ -539,12 +549,17 @@ void TableWriter::processSnapshotCopy(const char* data, size_t length) {
             } else { status = b->AppendNull(); }
         } else if (dt == "boolean" || dt == "bool") {
             auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
-            status = b->Append(col_data[0] != 0);
+            if (col_len == 1) {
+                status = b->Append(col_data[0] != 0);
+            } else { status = b->AppendNull(); }
         } else {
+            // Default to string for text, varchar, json, etc.
             auto* b = static_cast<arrow::StringBuilder*>(builder.get());
             status = b->Append(std::string(col_data, col_len));
         }
+
         if (!status.ok()) all_ok = false;
+        offset += col_len;
     }
 
     if (all_ok) {
