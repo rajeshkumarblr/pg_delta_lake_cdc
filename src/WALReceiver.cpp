@@ -30,45 +30,7 @@ void WALReceiver::run() {
   receiveLoop();
 }
 
-void WALReceiver::receiveLoop() {
-  uint64_t last_status_update_time = 0;
-  
-  while (keep_running_) {
-    if (PQconsumeInput(conn_) == 0) {
-        throw std::runtime_error(std::string("Error consuming input from Postgres: ") + PQerrorMessage(conn_));
-    }
 
-    char *copy_data = nullptr;
-    // Non-blocking check for data
-    int ret = PQgetCopyData(conn_, &copy_data, 1); // 1 = non-blocking
-
-    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-
-    if (now - last_status_update_time > 5) {
-        sendStandbyStatusUpdate(committed_lsn_->load());
-        last_status_update_time = now;
-    }
-
-    if (ret == 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
-    } else if (ret == -1) {
-      std::cout << "End of COPY data stream from PostgreSQL." << std::endl;
-      if (PGresult *res = PQgetResult(conn_)) {
-        std::cerr << "Postgres FATAL Error: " << PQerrorMessage(conn_) << std::endl;
-        PQclear(res);
-      }
-      return;
-    } else if (ret == -2) {
-      throw std::runtime_error(std::string("Error during PQgetCopyData: ") + PQerrorMessage(conn_));
-    }
-
-    handleCopyData(copy_data, ret);
-    PQfreemem(copy_data);
-  }
-}
 
 void WALReceiver::connect() {
   PGconn *normal_conn = PQconnectdb(conninfo_.c_str());
@@ -245,18 +207,37 @@ void WALReceiver::receiveLoop() {
   PQclear(res);
 
   char *msg = nullptr;
+  uint64_t last_status_update_time = 0;
+  
   while (keep_running_) {
-    int length = PQgetCopyData(conn_, &msg, 0);
-    if (length > 0) {
-      handleCopyData(msg, length);
-      PQfreemem(msg);
-    } else if (length == -1) {
+    if (PQconsumeInput(conn_) == 0) {
+        throw std::runtime_error(std::string("Error consuming input from Postgres: ") + PQerrorMessage(conn_));
+    }
+
+    int ret = PQgetCopyData(conn_, &msg, 1); // 1 = non-blocking
+
+    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+
+    if (now - last_status_update_time > 5) {
+        sendStandbyStatusUpdate(committed_lsn_->load());
+        last_status_update_time = now;
+    }
+
+    if (ret == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    } else if (ret == -1) {
       std::cout << "Replication stream closed." << std::endl;
       break;
-    } else if (length == -2) {
+    } else if (ret == -2) {
       std::cerr << "Error reading replication stream: " << PQerrorMessage(conn_) << std::endl;
       break;
     }
+
+    handleCopyData(msg, ret);
+    PQfreemem(msg);
   }
 }
 
