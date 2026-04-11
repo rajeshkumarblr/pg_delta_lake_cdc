@@ -213,6 +213,14 @@ void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn, char 
     queue_.push(msg);
 }
 
+void TableWriter::sendFlushSignal(uint64_t epoch_id) {
+    WalMessage msg;
+    msg.is_flush_signal = true;
+    msg.epoch_id = epoch_id;
+    msg.relation_id = info_.rel_id;
+    queue_.push(msg);
+}
+
 void TableWriter::forceFlush() {
     // Push a flush signal and wait for it to be processed
     WalMessage msg;
