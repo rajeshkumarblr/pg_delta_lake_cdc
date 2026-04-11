@@ -104,15 +104,15 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
             auto writer = std::make_unique<TableWriter>(info, output_dir_, committed_lsn_, row_group_size_, watermark_lsn_);
             writer->start();
             writers_[msg.relation_id] = std::move(writer);
-            it = writers_.find(msg.relation_id);
+            it = writers_.find(msg.relation_id); // Re-find to avoid iterator invalidation
         } else {
-            if (msg.pg_msg_type == 'S') {
-                 std::cerr << "ParquetWriter: FAILED to find TableInfo for Snapshot RelID: " << msg.relation_id << std::endl;
-            }
             return;
         }
     }
-    it->second->appendRow(msg.payload.data(), msg.payload.size(), msg.lsn, msg.pg_msg_type);
+    
+    if (it != writers_.end()) {
+        it->second->appendRow(msg.payload.data(), msg.payload.size(), msg.lsn, msg.pg_msg_type);
+    }
 }
 
 void ParquetWriter::broadcastFlushSignal(uint64_t epoch_id) {
