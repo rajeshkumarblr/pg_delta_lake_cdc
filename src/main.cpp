@@ -75,6 +75,9 @@ int main(int argc, char *argv[]) {
 
   try {
     auto registry = std::make_shared<TableRegistry>();
+    auto committed_lsn = std::make_shared<std::atomic<uint64_t>>(0);
+    BoundedBuffer<WalMessage> buffer(10000);
+
     WALReceiver receiver(conninfo, buffer, registry, committed_lsn);
     g_receiver = &receiver;
     

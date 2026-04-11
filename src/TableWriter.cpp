@@ -444,80 +444,74 @@ void TableWriter::flushPartition(uint64_t epoch_id) {
 void TableWriter::processSnapshotCopy(const char* data, size_t length) {
     size_t offset = 0;
     
-    // Check for binary header (PGCOPY\n\377\r\n\0)
-    if (length >= 11 && std::memcmp(data, "PGCOPY\n\377\r\n\0", 11) == 0) {
-        offset = 11 + 4 + 4; // Skip header, flags, and header extension
-    }
+    if (offset + 2 > length) return;
+    int16_t ncolumns_n;
+    std::memcpy(&ncolumns_n, data + offset, 2);
+    int16_t ncolumns = ntohs(ncolumns_n);
+    offset += 2;
 
-    while (offset + 2 <= length) {
-        int16_t ncolumns_n;
-        std::memcpy(&ncolumns_n, data + offset, 2);
-        int16_t ncolumns = ntohs(ncolumns_n);
-        offset += 2;
+    if (ncolumns == -1) return;
 
-        if (ncolumns == -1) break; // Trailer - end of stream
+    bool all_ok = true;
+    for (size_t col = 0; col < info_.columns.size(); ++col) {
+        if (offset + 4 > length) { all_ok = false; break; }
+        
+        int32_t col_len_n;
+        std::memcpy(&col_len_n, data + offset, 4);
+        int32_t col_len = ntohl(col_len_n);
+        offset += 4;
 
-        bool all_ok = true;
-        for (size_t col = 0; col < info_.columns.size(); ++col) {
-            if (offset + 4 > length) { all_ok = false; break; }
-            
-            int32_t col_len_n;
-            std::memcpy(&col_len_n, data + offset, 4);
-            int32_t col_len = ntohl(col_len_n);
-            offset += 4;
-
-            auto& builder = builders_[col];
-            if (col_len == -1) {
-                if (!builder->AppendNull().ok()) all_ok = false;
-                continue;
-            }
-
-            if (offset + col_len > length) { all_ok = false; break; }
-            std::string col_val(data + offset, col_len);
-            offset += col_len;
-
-            arrow::Status status;
-            const std::string& dt = info_.columns[col].data_type;
-
-            if (dt == "integer" || dt == "int4" || dt == "serial") {
-                auto* b = static_cast<arrow::Int32Builder*>(builder.get());
-                try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
-                auto* b = static_cast<arrow::Int64Builder*>(builder.get());
-                try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "real" || dt == "float4") {
-                auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
-                try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
-                auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
-                try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
-            } else if (dt == "boolean" || dt == "bool") {
-                auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
-                bool val = (col_val == "t" || col_val == "true" || col_val == "1");
-                status = b->Append(val);
-            } else {
-                auto* b = static_cast<arrow::StringBuilder*>(builder.get());
-                status = b->Append(col_val);
-            }
-            if (!status.ok()) all_ok = false;
+        auto& builder = builders_[col];
+        if (col_len == -1) {
+            if (!builder->AppendNull().ok()) all_ok = false;
+            continue;
         }
 
+        if (offset + col_len > length) { all_ok = false; break; }
+        std::string col_val(data + offset, col_len);
+        offset += col_len;
+
+        arrow::Status status;
+        const std::string& dt = info_.columns[col].data_type;
+
+        if (dt == "integer" || dt == "int4" || dt == "serial") {
+            auto* b = static_cast<arrow::Int32Builder*>(builder.get());
+            try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
+        } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
+            auto* b = static_cast<arrow::Int64Builder*>(builder.get());
+            try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
+        } else if (dt == "real" || dt == "float4") {
+            auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
+            try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
+        } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
+            auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
+            try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
+        } else if (dt == "boolean" || dt == "bool") {
+            auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
+            bool val = (col_val == "t" || col_val == "true" || col_val == "1");
+            status = b->Append(val);
+        } else {
+            auto* b = static_cast<arrow::StringBuilder*>(builder.get());
+            status = b->Append(col_val);
+        }
+        if (!status.ok()) all_ok = false;
+    }
+
+    if (all_ok) {
+        // Meta columns
+        size_t col_idx = info_.columns.size();
+        auto* op_builder = static_cast<arrow::StringBuilder*>(builders_[col_idx++].get());
+        auto* ts_builder = static_cast<arrow::Int64Builder*>(builders_[col_idx++].get());
+        auto* lsn_builder = static_cast<arrow::UInt64Builder*>(builders_[col_idx++].get());
+
+        if (!op_builder->Append("SNAPSHOT").ok()) all_ok = false;
+        if (!ts_builder->Append(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()).ok()) all_ok = false;
+        if (!lsn_builder->Append(watermark_lsn_).ok()) all_ok = false;
+
         if (all_ok) {
-            // Meta columns
-            size_t col_idx = info_.columns.size();
-            auto* op_builder = static_cast<arrow::StringBuilder*>(builders_[col_idx++].get());
-            auto* ts_builder = static_cast<arrow::Int64Builder*>(builders_[col_idx++].get());
-            auto* lsn_builder = static_cast<arrow::UInt64Builder*>(builders_[col_idx++].get());
-
-            if (!op_builder->Append("SNAPSHOT").ok()) all_ok = false;
-            if (!ts_builder->Append(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()).ok()) all_ok = false;
-            if (!lsn_builder->Append(watermark_lsn_).ok()) all_ok = false;
-
-            if (all_ok) {
-                current_rows_++;
-                if (current_rows_ >= row_group_size_) {
-                    flushPartition(0);
-                }
+            current_rows_++;
+            if (current_rows_ >= row_group_size_) {
+                flushPartition(0);
             }
         }
     }

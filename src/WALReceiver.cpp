@@ -260,7 +260,7 @@ void WALReceiver::performSnapshot() {
     for (const auto& table : all_tables) {
         std::cout << "Performing snapshot for table: " << table.schema << "." << table.table_name << std::endl;
         
-        std::string copy_query = "COPY (SELECT * FROM " + table.schema + "." + table.table_name + ") TO STDOUT WITH (FORMAT binary);";
+        std::string copy_query = "COPY " + table.schema + "." + table.table_name + " TO STDOUT WITH (FORMAT binary);";
         res = PQexec(snap_conn, copy_query.c_str());
         if (PQresultStatus(res) != PGRES_COPY_OUT) {
             std::cerr << "Failed to start binary COPY for " << table.table_name << ": " << PQerrorMessage(snap_conn) << std::endl;
@@ -269,16 +269,68 @@ void WALReceiver::performSnapshot() {
         }
         PQclear(res);
 
-        char *buffer = nullptr;
+        std::vector<char> copy_buffer;
+        char *chunk_buffer = nullptr;
         int ret;
-        while ((ret = PQgetCopyData(snap_conn, &buffer, 0)) > 0) {
-            WalMessage msg;
-            msg.relation_id = table.rel_id;
-            msg.lsn = watermark_lsn_;
-            msg.pg_msg_type = 'S'; // Snapshot data
-            msg.payload.assign(buffer, buffer + ret);
-            buffer_.push(msg);
-            PQfreemem(buffer);
+        bool header_skipped = false;
+
+        while ((ret = PQgetCopyData(snap_conn, &chunk_buffer, 0)) > 0) {
+            copy_buffer.insert(copy_buffer.end(), chunk_buffer, chunk_buffer + ret);
+            PQfreemem(chunk_buffer);
+
+            size_t offset = 0;
+            // Handle header once
+            if (!header_skipped && copy_buffer.size() >= 11 + 4 + 4) {
+                if (std::memcmp(copy_buffer.data(), "PGCOPY\n\377\r\n\0", 11) == 0) {
+                    offset = 11 + 4 + 4;
+                    header_skipped = true;
+                }
+            } else if (!header_skipped) {
+                continue; // Wait for more data
+            }
+
+            while (offset + 2 <= copy_buffer.size()) {
+                int16_t ncolumns_n;
+                std::memcpy(&ncolumns_n, copy_buffer.data() + offset, 2);
+                int16_t ncolumns = ntohs(ncolumns_n);
+
+                if (ncolumns == -1) { // Trailer
+                    offset += 2;
+                    break;
+                }
+
+                // Check if we have the whole row
+                size_t row_start = offset;
+                size_t temp_offset = offset + 2;
+                bool row_complete = true;
+                for (int i = 0; i < ncolumns; ++i) {
+                    if (temp_offset + 4 > copy_buffer.size()) { row_complete = false; break; }
+                    int32_t flen_n;
+                    std::memcpy(&flen_n, copy_buffer.data() + temp_offset, 4);
+                    int32_t flen = ntohl(flen_n);
+                    temp_offset += 4;
+                    if (flen != -1) {
+                        if (temp_offset + flen > copy_buffer.size()) { row_complete = false; break; }
+                        temp_offset += flen;
+                    }
+                }
+
+                if (!row_complete) break; // Need more data
+
+                // Emit row
+                WalMessage msg;
+                msg.relation_id = table.rel_id;
+                msg.lsn = watermark_lsn_;
+                msg.pg_msg_type = 'S';
+                msg.payload.assign(copy_buffer.begin() + row_start, copy_buffer.begin() + temp_offset);
+                buffer_.push(msg);
+
+                offset = temp_offset;
+            }
+            // Remove processed data
+            if (offset > 0) {
+                copy_buffer.erase(copy_buffer.begin(), copy_buffer.begin() + offset);
+            }
         }
 
         if (ret == -2) {
