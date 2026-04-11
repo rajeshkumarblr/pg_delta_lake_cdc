@@ -68,9 +68,9 @@ void WALReceiver::connect() {
 
 void WALReceiver::fetchSchemas(PGconn *normal_conn) {
   std::cout << "Fetching schema definitions from PostgreSQL..." << std::endl;
-  // We get columns for all tables in 'public' schema
+  // We get columns for all tables in 'public' schema, including OID for RelID mapping
   std::string query =
-      "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
+      "SELECT c.oid, n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), "
       "NOT a.attnotnull, COALESCE(i.indisprimary, false), c.relreplident "
       "FROM pg_class c "
       "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -91,28 +91,24 @@ void WALReceiver::fetchSchemas(PGconn *normal_conn) {
   TableInfo current_info;
 
   for (int i = 0; i < rows; ++i) {
-    std::string schema = PQgetvalue(res, i, 0);
-    std::string table = PQgetvalue(res, i, 1);
-    std::string col_name = PQgetvalue(res, i, 2);
-    std::string data_type = PQgetvalue(res, i, 3);
-    bool is_nullable = (std::string(PQgetvalue(res, i, 4)) == "t");
-    bool is_pk = (std::string(PQgetvalue(res, i, 5)) == "t");
-    char repl_ident = PQgetvalue(res, i, 6)[0];
+    uint32_t oid = std::stoul(PQgetvalue(res, i, 0));
+    std::string schema = PQgetvalue(res, i, 1);
+    std::string table = PQgetvalue(res, i, 2);
+    std::string col_name = PQgetvalue(res, i, 3);
+    std::string data_type = PQgetvalue(res, i, 4);
+    bool is_nullable = (std::string(PQgetvalue(res, i, 5)) == "t");
+    bool is_pk = (std::string(PQgetvalue(res, i, 6)) == "t");
+    char repl_ident = PQgetvalue(res, i, 7)[0];
 
     if (table != current_table) {
       if (!current_table.empty()) {
-        // Warning check for Replica Identity
-        bool has_pk = false;
-        for (const auto& c : current_info.columns) if (c.pk_flag) has_pk = true;
-        if (!has_pk && current_info.repl_ident != 'f') {
-            std::cerr << "WARNING: Table [" << current_info.schema << "." << current_info.table_name 
-                      << "] has no Primary Key and REPLICA IDENTITY is not FULL. DELETE/UPDATE operations may fail to identify rows." << std::endl;
-        }
+        registry_->mapRelationId(current_info.rel_id, current_info);
         registry_->addTable(current_info.schema, current_table, current_info);
       }
       current_table = table;
       current_info.schema = schema;
       current_info.table_name = table;
+      current_info.rel_id = oid;
       current_info.repl_ident = repl_ident;
       current_info.columns.clear();
     }
@@ -126,12 +122,12 @@ void WALReceiver::fetchSchemas(PGconn *normal_conn) {
   }
 
   if (!current_table.empty()) {
+    registry_->mapRelationId(current_info.rel_id, current_info);
     registry_->addTable(current_info.schema, current_table, current_info);
   }
 
   PQclear(res);
-  std::cout << "Schema definitions successfully populated in registry."
-            << std::endl;
+  std::cout << "Schema definitions successfully populated in registry." << std::endl;
 }
 
 void WALReceiver::startLogicalReplication() {
