@@ -22,33 +22,20 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
       global_committed_lsn_(committed_lsn), 
       keep_running_(false), oldest_lsn_in_queue_(0), pending_epoch_(0), queue_(10000) {
     // Initialize FileSystem from URI or local path
-    if (!output_dir_.empty()) {
+    if (!output_dir_.empty() && output_dir_.find("://") != std::string::npos) {
         std::string path;
-        std::string uri = output_dir_;
-        // If no scheme is provided, assume local path and prepend file://
-        if (uri.find("://") == std::string::npos) {
-            if (uri[0] != '/') {
-                // Prepend current path for relative paths
-                uri = "file://" + std::filesystem::current_path().string() + "/" + uri;
-            } else {
-                uri = "file://" + uri;
-            }
-        }
-        
-        auto result = arrow::fs::FileSystemFromUri(uri, &path);
-        if (!result.ok()) {
-            throw std::runtime_error("Failed to initialize filesystem from " + uri + ": " + result.status().ToString());
-        }
+        auto result = arrow::fs::FileSystemFromUri(output_dir_, &path);
+        if (!result.ok()) throw std::runtime_error(result.status().ToString());
         fs_ = result.ValueOrDie();
         base_path_ = path;
     } else {
         fs_ = std::make_shared<arrow::fs::LocalFileSystem>();
-        if (!output_dir.empty() && output_dir[0] == '/') {
-             base_path_ = output_dir;
-        } else if (!output_dir.empty()) {
-             base_path_ = std::filesystem::current_path().string() + "/" + output_dir;
+        if (!output_dir_.empty() && output_dir_[0] == '/') {
+            base_path_ = output_dir_;
+        } else if (!output_dir_.empty()) {
+            base_path_ = std::filesystem::current_path().string() + "/" + output_dir_;
         } else {
-             base_path_ = std::filesystem::current_path().string();
+            base_path_ = std::filesystem::current_path().string();
         }
     }
 
