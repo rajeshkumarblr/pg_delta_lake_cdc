@@ -94,6 +94,15 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
         return;
     }
 
+    if (msg.pg_msg_type == 'F') {
+        auto it = writers_.find(msg.relation_id);
+        if (it != writers_.end()) {
+            std::cout << "ParquetWriter: Received force-flush signal for " << msg.relation_id << std::endl;
+            it->second->forceFlush();
+        }
+        return;
+    }
+
     auto it = writers_.find(msg.relation_id);
     if (it == writers_.end()) {
         TableInfo info;

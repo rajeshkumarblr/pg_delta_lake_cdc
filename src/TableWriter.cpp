@@ -187,6 +187,13 @@ void TableWriter::resetBuilders() {
 }
 
 void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn, char pg_msg_type) {
+    if (pg_msg_type == 'S') {
+        // Process snapshot rows synchronously to ensure they are durable 
+        // before the WAL stream starts.
+        processSnapshotCopy(data, length);
+        return;
+    }
+
     WalMessage msg;
     msg.relation_id = info_.rel_id;
     msg.lsn = lsn;
@@ -211,6 +218,12 @@ void TableWriter::sendFlushSignal(uint64_t epoch_id) {
     msg.epoch_id = epoch_id;
     msg.relation_id = info_.rel_id;
     queue_.push(msg);
+}
+
+void TableWriter::forceFlush() {
+    if (current_rows_ > 0) {
+        flushPartition(0);
+    }
 }
 
 uint64_t TableWriter::getOldestPendingLSN() const {

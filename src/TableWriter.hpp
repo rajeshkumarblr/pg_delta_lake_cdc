@@ -23,6 +23,7 @@ public:
     void appendRow(const char* tuple_data, size_t length, uint64_t lsn, char pg_msg_type);
     void sendFlushSignal(uint64_t epoch_id);
     void flushPartition(uint64_t epoch_id);
+    void forceFlush();
     void start();
     void stop();
 

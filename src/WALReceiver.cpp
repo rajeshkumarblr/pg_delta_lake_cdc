@@ -347,6 +347,12 @@ void WALReceiver::performSnapshot() {
 
         std::cout << "Table [" << table.table_name << "]: Snapshot emitted " << table_rows << " rows." << std::endl;
 
+        // Force a flush for the snapshot data immediately
+        WalMessage flush_msg;
+        flush_msg.relation_id = table.rel_id;
+        flush_msg.pg_msg_type = 'F'; // Custom Flush type
+        buffer_.push(flush_msg);
+
         if (ret == -2) {
             std::cerr << "Error reading COPY data for " << table.table_name << ": " << PQerrorMessage(snap_conn) << std::endl;
         }
