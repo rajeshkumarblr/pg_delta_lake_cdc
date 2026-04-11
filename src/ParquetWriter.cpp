@@ -86,14 +86,14 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
     }
 
     if (msg.pg_msg_type == 'R') {
-        std::cout << "ParquetWriter: Detected Schema Change for Relation " << msg.relation_id << ". Re-initializing worker..." << std::endl;
         auto it = writers_.find(msg.relation_id);
         if (it != writers_.end()) {
-            it->second->stop();
+            std::cout << "ParquetWriter: Detected Schema Change for Relation " << msg.relation_id << ". Re-initializing worker..." << std::endl;
             writers_.erase(it);
         }
         return;
     }
+
     auto it = writers_.find(msg.relation_id);
     if (it == writers_.end()) {
         TableInfo info;
@@ -104,7 +104,7 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
             auto writer = std::make_unique<TableWriter>(info, output_dir_, committed_lsn_, row_group_size_, watermark_lsn_);
             writer->start();
             writers_[msg.relation_id] = std::move(writer);
-            it = writers_.find(msg.relation_id); // Re-find to avoid iterator invalidation
+            it = writers_.find(msg.relation_id);
         } else {
             return;
         }

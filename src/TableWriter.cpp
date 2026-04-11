@@ -53,12 +53,12 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
     try {
         std::string table_dir = base_path_ + "/" + info_.table_name;
         std::string log_dir = table_dir + "/_delta_log";
+        std::cout << "TableWriter [" << info_.table_name << "]: Scanning for existing Delta logs in " << log_dir << std::endl;
         if (std::filesystem::exists(log_dir)) {
             for (const auto& entry : std::filesystem::directory_iterator(log_dir)) {
                 std::string filename = entry.path().filename().string();
                 if (filename.size() > 5 && filename.substr(filename.size() - 5) == ".json") {
                     try {
-                        // Delta log files are named 00000000000000000001.json (20 digits)
                         std::string version_str = filename.substr(0, 20);
                         int v = std::stoi(version_str);
                         if (v >= commit_version_) commit_version_ = v + 1;
@@ -68,7 +68,7 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
         }
     } catch (...) {}
     
-    std::cout << "TableWriter [" << info_.table_name << "]: Initialized at Delta version " << commit_version_ << std::endl;
+    std::cout << "TableWriter [" << info_.table_name << "]: Bound to " << (base_path_ + "/" + info_.table_name) << ", Version " << commit_version_ << std::endl;
 }
 
 TableWriter::~TableWriter() {

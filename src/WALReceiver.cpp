@@ -236,6 +236,7 @@ void WALReceiver::receiveLoop() {
     handleCopyData(msg, ret);
     PQfreemem(msg);
   }
+  std::cout << "Logical Replication: receiveLoop finished. Shutting down..." << std::endl;
 }
 
 
