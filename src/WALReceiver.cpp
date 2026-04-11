@@ -13,7 +13,7 @@ WALReceiver::WALReceiver(const std::string &conninfo,
                          std::shared_ptr<TableRegistry> registry,
                          std::shared_ptr<std::atomic<uint64_t>> committed_lsn)
     : conninfo_(conninfo), buffer_(buffer), registry_(std::move(registry)),
-      committed_lsn_(committed_lsn), conn_(nullptr), keep_running_(true) {}
+      committed_lsn_(committed_lsn), conn_(nullptr), lifecycle_conn_(nullptr), keep_running_(true) {}
 
 WALReceiver::~WALReceiver() {
   stop();
@@ -179,45 +179,63 @@ void WALReceiver::startLogicalReplication() {
   std::string slot_name = env_slot ? env_slot : "hn_stories_slot";
   std::string pub_name = env_pub ? env_pub : "hn_stories_pub";
 
-  // Check if slot exists, if not create it and export snapshot
-  std::string check_query = "SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slot_name + "';";
+  // 1. Establish a normal SQL connection to manage the snapshot lifecycle
+  lifecycle_conn_ = PQconnectdb(conninfo_.c_str());
+  if (PQstatus(lifecycle_conn_) != CONNECTION_OK) {
+      std::string err = PQerrorMessage(lifecycle_conn_);
+      PQfinish(lifecycle_conn_);
+      lifecycle_conn_ = nullptr;
+      throw std::runtime_error("Lifecycle connection failed: " + err);
+  }
+
+  // 2. Start a transaction to pin the snapshot
+  PQexec(lifecycle_conn_, "BEGIN ISOLATION LEVEL REPEATABLE READ;");
+
+  // 3. Create the slot via SQL if it doesn't exist
+  std::string create_slot_sql = "SELECT slot_name, confirmed_flush_lsn FROM pg_create_logical_replication_slot('" + 
+                                slot_name + "', 'pgoutput', false, false) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slot_name + "');";
+  PGresult *res = PQexec(lifecycle_conn_, create_slot_sql.c_str());
   
-  // Note: We need a temporary normal connection to check/create slot if we want to use SQL,
-  // OR we use the replication connection with replication commands.
-  // Replication connection supports CREATE_REPLICATION_SLOT.
-  
-  std::string create_query = "CREATE_REPLICATION_SLOT \"" + slot_name + "\" LOGICAL pgoutput EXPORT_SNAPSHOT;";
-  PGresult *res = PQexec(conn_, create_query.c_str());
-  
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+      std::string err = PQerrorMessage(lifecycle_conn_);
+      PQclear(res);
+      // If it already exists, just get the info
+      std::string get_slot_sql = "SELECT slot_name, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = '" + slot_name + "';";
+      res = PQexec(lifecycle_conn_, get_slot_sql.c_str());
+  }
+
   if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-      watermark_lsn_ = 0;
       std::string lsn_str = PQgetvalue(res, 0, 1);
-      snapshot_id_ = PQgetvalue(res, 0, 2);
       
       uint32_t high, low;
       if (sscanf(lsn_str.c_str(), "%X/%X", &high, &low) == 2) {
           watermark_lsn_ = ((uint64_t)high << 32) | low;
       }
-      
-      std::cout << "Created replication slot '" << slot_name << "'. Consistent point: " << lsn_str 
-                << ", Snapshot ID: " << snapshot_id_ << std::endl;
-  } else {
-      // Slot probably exists. We need the consistent point from elsewhere or assume it's current.
-      // For a fresh Snapshot-then-CDC, the slot SHOULD be created now.
-      std::string err = PQerrorMessage(conn_);
-      if (err.find("already exists") != std::string::npos) {
-          std::cout << "Replication slot '" << slot_name << "' already exists. Continuing without fresh snapshot." << std::endl;
-      } else {
-          PQclear(res);
-          throw std::runtime_error("Could not create replication slot: " + err);
-      }
   }
   PQclear(res);
 
+  // 4. Export the snapshot from this transaction
+  res = PQexec(lifecycle_conn_, "SELECT pg_export_snapshot();");
+  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+      snapshot_id_ = PQgetvalue(res, 0, 0);
+      std::cout << "Exported Snapshot: [" << snapshot_id_ << "] at LSN: " << watermark_lsn_ << std::endl;
+  }
+  PQclear(res);
+
+  std::cout << "Replication slot '" << slot_name << "' ready. Lifecycle connection pinned." << std::endl;
+}
+
+void WALReceiver::receiveLoop() {
+  const char *env_slot = std::getenv("PG_SLOT_NAME");
+  const char *env_pub = std::getenv("PG_PUBLICATION_NAME");
+  std::string slot_name = env_slot ? env_slot : "hn_stories_slot";
+  std::string pub_name = env_pub ? env_pub : "hn_stories_pub";
+
+  std::cout << "Starting logical replication stream on slot '" << slot_name << "'..." << std::endl;
   std::string start_query = "START_REPLICATION SLOT \"" + slot_name +
                       "\" LOGICAL 0/0 (proto_version '1', publication_names '" +
                       pub_name + "');";
-  res = PQexec(conn_, start_query.c_str());
+  PGresult *res = PQexec(conn_, start_query.c_str());
 
   if (PQresultStatus(res) != PGRES_COPY_BOTH) {
     std::string err = PQerrorMessage(conn_);
@@ -225,8 +243,21 @@ void WALReceiver::startLogicalReplication() {
     throw std::runtime_error("Could not start logical replication: " + err);
   }
   PQclear(res);
-  std::cout << "Started logical replication stream on slot '" << slot_name
-            << "'." << std::endl;
+
+  char *msg = nullptr;
+  while (keep_running_) {
+    int length = PQgetCopyData(conn_, &msg, 0);
+    if (length > 0) {
+      handleCopyData(msg, length);
+      PQfreemem(msg);
+    } else if (length == -1) {
+      std::cout << "Replication stream closed." << std::endl;
+      break;
+    } else if (length == -2) {
+      std::cerr << "Error reading replication stream: " << PQerrorMessage(conn_) << std::endl;
+      break;
+    }
+  }
 }
 
 
@@ -340,6 +371,14 @@ void WALReceiver::performSnapshot() {
 
     PQexec(snap_conn, "COMMIT;");
     PQfinish(snap_conn);
+
+    // Now we can release the lifecycle connection as the snapshot is consumed
+    if (lifecycle_conn_) {
+        PQexec(lifecycle_conn_, "COMMIT;");
+        PQfinish(lifecycle_conn_);
+        lifecycle_conn_ = nullptr;
+    }
+
     std::cout << "Snapshot phase completed successfully." << std::endl;
 }
 

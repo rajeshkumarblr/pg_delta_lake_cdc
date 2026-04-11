@@ -41,6 +41,7 @@ private:
   std::shared_ptr<TableRegistry> registry_;
   std::shared_ptr<std::atomic<uint64_t>> committed_lsn_;
   PGconn *conn_;
+  PGconn *lifecycle_conn_; // For keeping snapshots alive
   std::atomic<bool> keep_running_;
   std::string snapshot_id_;
   uint64_t watermark_lsn_ = 0;
