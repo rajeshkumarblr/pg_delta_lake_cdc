@@ -53,6 +53,11 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
     try {
         std::string table_dir = base_path_ + "/" + info_.table_name;
         std::string log_dir = table_dir + "/_delta_log";
+        
+        // Ensure table directory exists
+        fs_->CreateDir(table_dir, true);
+        fs_->CreateDir(log_dir, true);
+        
         std::cout << "TableWriter [" << info_.table_name << "]: Scanning for existing Delta logs in " << log_dir << std::endl;
         if (std::filesystem::exists(log_dir)) {
             for (const auto& entry : std::filesystem::directory_iterator(log_dir)) {
