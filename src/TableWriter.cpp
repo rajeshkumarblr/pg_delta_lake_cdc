@@ -43,7 +43,13 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
         base_path_ = path;
     } else {
         fs_ = std::make_shared<arrow::fs::LocalFileSystem>();
-        base_path_ = std::filesystem::current_path().string();
+        if (!output_dir.empty() && output_dir[0] == '/') {
+             base_path_ = output_dir;
+        } else if (!output_dir.empty()) {
+             base_path_ = std::filesystem::current_path().string() + "/" + output_dir;
+        } else {
+             base_path_ = std::filesystem::current_path().string();
+        }
     }
 
     setupSchemaAndBuilders();
