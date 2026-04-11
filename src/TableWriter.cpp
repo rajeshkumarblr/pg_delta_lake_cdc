@@ -240,7 +240,13 @@ void TableWriter::processInternal(const WalMessage& msg) {
     }
 
     // Handover Guard: Ignore WAL messages that were already captured by the snapshot
-    if (msg.lsn <= watermark_lsn_) {
+    // But ALWAYS allow SNAPSHOT ('S') messages through
+    if (msg.pg_msg_type != 'S' && msg.lsn <= watermark_lsn_) {
+        return;
+    }
+
+    if (msg.pg_msg_type == 'S') {
+        processSnapshotCopy(msg.payload.data(), msg.payload.size());
         return;
     }
     
@@ -468,7 +474,7 @@ void TableWriter::processSnapshotCopy(const char* data, size_t length) {
         }
 
         if (offset + col_len > length) { all_ok = false; break; }
-        std::string col_val(data + offset, col_len);
+        const char* col_data = data + offset;
         offset += col_len;
 
         arrow::Status status;
@@ -476,23 +482,44 @@ void TableWriter::processSnapshotCopy(const char* data, size_t length) {
 
         if (dt == "integer" || dt == "int4" || dt == "serial") {
             auto* b = static_cast<arrow::Int32Builder*>(builder.get());
-            try { status = b->Append(std::stoi(col_val)); } catch(...) { status = b->AppendNull(); }
+            if (col_len == 4) {
+                int32_t val_n;
+                std::memcpy(&val_n, col_data, 4);
+                status = b->Append(ntohl(val_n));
+            } else { status = b->AppendNull(); }
         } else if (dt == "bigint" || dt == "int8" || dt == "bigserial") {
             auto* b = static_cast<arrow::Int64Builder*>(builder.get());
-            try { status = b->Append(std::stoll(col_val)); } catch(...) { status = b->AppendNull(); }
+            if (col_len == 8) {
+                uint64_t val_n;
+                std::memcpy(&val_n, col_data, 8);
+                status = b->Append(be64toh(val_n));
+            } else { status = b->AppendNull(); }
         } else if (dt == "real" || dt == "float4") {
             auto* b = static_cast<arrow::FloatBuilder*>(builder.get());
-            try { status = b->Append(std::stof(col_val)); } catch(...) { status = b->AppendNull(); }
+            if (col_len == 4) {
+                uint32_t val_n;
+                std::memcpy(&val_n, col_data, 4);
+                uint32_t val_h = ntohl(val_n);
+                float fval;
+                std::memcpy(&fval, &val_h, 4);
+                status = b->Append(fval);
+            } else { status = b->AppendNull(); }
         } else if (dt == "double precision" || dt == "float8" || dt == "numeric") {
             auto* b = static_cast<arrow::DoubleBuilder*>(builder.get());
-            try { status = b->Append(std::stod(col_val)); } catch(...) { status = b->AppendNull(); }
+            if (col_len == 8) {
+                uint64_t val_n;
+                std::memcpy(&val_n, col_data, 8);
+                uint64_t val_h = be64toh(val_n);
+                double dval;
+                std::memcpy(&dval, &val_h, 8);
+                status = b->Append(dval);
+            } else { status = b->AppendNull(); }
         } else if (dt == "boolean" || dt == "bool") {
             auto* b = static_cast<arrow::BooleanBuilder*>(builder.get());
-            bool val = (col_val == "t" || col_val == "true" || col_val == "1");
-            status = b->Append(val);
+            status = b->Append(col_data[0] != 0);
         } else {
             auto* b = static_cast<arrow::StringBuilder*>(builder.get());
-            status = b->Append(col_val);
+            status = b->Append(std::string(col_data, col_len));
         }
         if (!status.ok()) all_ok = false;
     }
