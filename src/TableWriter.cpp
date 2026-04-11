@@ -17,6 +17,7 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
     : info_(info), output_dir_(output_dir), file_counter_(1),
       insert_count_(0), update_count_(0), delete_count_(0),
       row_group_size_(row_group_size), current_rows_(0),
+      commit_version_(0),
       latest_lsn_(watermark_lsn), watermark_lsn_(watermark_lsn),
       global_committed_lsn_(committed_lsn), 
       keep_running_(false), oldest_lsn_in_queue_(0), pending_epoch_(0), queue_(10000) {
@@ -46,6 +47,28 @@ TableWriter::TableWriter(const TableInfo& info, const std::string& output_dir,
     }
 
     setupSchemaAndBuilders();
+
+    // Initialize Delta Log version by scanning the _delta_log directory
+    commit_version_ = 0;
+    try {
+        std::string table_dir = base_path_ + "/" + info_.table_name;
+        std::string log_dir = table_dir + "/_delta_log";
+        if (std::filesystem::exists(log_dir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(log_dir)) {
+                std::string filename = entry.path().filename().string();
+                if (filename.size() > 5 && filename.substr(filename.size() - 5) == ".json") {
+                    try {
+                        // Delta log files are named 00000000000000000001.json (20 digits)
+                        std::string version_str = filename.substr(0, 20);
+                        int v = std::stoi(version_str);
+                        if (v >= commit_version_) commit_version_ = v + 1;
+                    } catch (...) {}
+                }
+            }
+        }
+    } catch (...) {}
+    
+    std::cout << "TableWriter [" << info_.table_name << "]: Initialized at Delta version " << commit_version_ << std::endl;
 }
 
 TableWriter::~TableWriter() {
@@ -532,7 +555,9 @@ void TableWriter::processSnapshotCopy(const char* data, size_t length) {
         auto* lsn_builder = static_cast<arrow::UInt64Builder*>(builders_[col_idx++].get());
 
         if (!op_builder->Append("SNAPSHOT").ok()) all_ok = false;
-        if (!ts_builder->Append(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()).ok()) all_ok = false;
+        // Use a fixed timestamp in the past for snapshot records 
+        // to ensure they are correctly superseded by any later WAL changes
+        if (!ts_builder->Append(0).ok()) all_ok = false;
         if (!lsn_builder->Append(watermark_lsn_).ok()) all_ok = false;
 
         if (all_ok) {

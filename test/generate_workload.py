@@ -97,9 +97,9 @@ def generate_workload():
     cur.execute("DELETE FROM integration_test WHERE id = 96000;")
     conn.commit()
 
-    # 6. UPDATE Test: Modify some scores
+    # 6. UPDATE Test: Modify some scores (avoiding historical rows for verification)
     print("Stage 4: Testing UPDATE...")
-    cur.execute("UPDATE integration_test SET score = score + 100 WHERE id < 100;")
+    cur.execute("UPDATE integration_test SET score = score + 100 WHERE id > 100 AND id < 200;")
     conn.commit()
 
     # 7. Secondary Table Test

@@ -272,6 +272,7 @@ void WALReceiver::performSnapshot() {
     auto all_tables = registry_->getAllTables();
     for (const auto& table : all_tables) {
         std::cout << "Performing snapshot for table: " << table.schema << "." << table.table_name << std::endl;
+        size_t table_rows = 0;
         
         std::string copy_query = "COPY " + table.schema + "." + table.table_name + " TO STDOUT WITH (FORMAT binary);";
         res = PQexec(snap_conn, copy_query.c_str());
@@ -338,6 +339,7 @@ void WALReceiver::performSnapshot() {
                 msg.payload.assign(copy_buffer.begin() + row_start, copy_buffer.begin() + temp_offset);
                 buffer_.push(msg);
 
+                table_rows++;
                 offset = temp_offset;
             }
             // Remove processed data
@@ -345,6 +347,8 @@ void WALReceiver::performSnapshot() {
                 copy_buffer.erase(copy_buffer.begin(), copy_buffer.begin() + offset);
             }
         }
+
+        std::cout << "Table [" << table.table_name << "]: Snapshot emitted " << table_rows << " rows." << std::endl;
 
         if (ret == -2) {
             std::cerr << "Error reading COPY data for " << table.table_name << ": " << PQerrorMessage(snap_conn) << std::endl;
