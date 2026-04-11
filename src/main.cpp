@@ -116,4 +116,11 @@ int main(int argc, char *argv[]) {
         std::cout << "Logical replication stream interrupted. Re-starting in 2s..." << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
+  } catch (const std::exception &e) {
+    std::cerr << "Fatal Error: " << e.what() << std::endl;
+    return 1;
+  }
+
+  std::cout << "Daemon stopped cleanly.\n";
+  return 0;
 }
