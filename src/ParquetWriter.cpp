@@ -98,11 +98,17 @@ void ParquetWriter::processMessage(const WalMessage& msg) {
     if (it == writers_.end()) {
         TableInfo info;
         if (registry_->getTableByRelationId(msg.relation_id, info)) {
+            if (msg.pg_msg_type == 'S') {
+                std::cout << "ParquetWriter: Dispatching Snapshot row for " << info.table_name << " (RelID: " << msg.relation_id << ")" << std::endl;
+            }
             auto writer = std::make_unique<TableWriter>(info, output_dir_, committed_lsn_, row_group_size_, watermark_lsn_);
             writer->start();
             writers_[msg.relation_id] = std::move(writer);
             it = writers_.find(msg.relation_id);
         } else {
+            if (msg.pg_msg_type == 'S') {
+                 std::cerr << "ParquetWriter: FAILED to find TableInfo for Snapshot RelID: " << msg.relation_id << std::endl;
+            }
             return;
         }
     }
