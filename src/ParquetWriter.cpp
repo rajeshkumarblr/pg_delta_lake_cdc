@@ -15,6 +15,7 @@ ParquetWriter::~ParquetWriter() {
 }
 
 void ParquetWriter::start() {
+    if (keep_running_) return;
     keep_running_ = true;
     worker_thread_ = std::thread(&ParquetWriter::run, this);
 }

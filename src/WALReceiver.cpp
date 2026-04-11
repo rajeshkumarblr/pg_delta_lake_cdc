@@ -245,7 +245,7 @@ void WALReceiver::receiveLoop() {
 
 void WALReceiver::performSnapshot() {
     if (snapshot_id_.empty()) {
-        std::cout << "No snapshot ID available. Skipping snapshot phase." << std::endl;
+        std::cout << "No snapshot ID available or snapshot already performed. Skipping." << std::endl;
         return;
     }
 
@@ -354,6 +354,7 @@ void WALReceiver::performSnapshot() {
     PQexec(snap_conn, "COMMIT;");
     PQfinish(snap_conn);
 
+    snapshot_id_ = ""; // Mark as done to prevent re-execution on reconnection
     std::cout << "Snapshot phase completed successfully." << std::endl;
 }
 
