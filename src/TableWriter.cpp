@@ -83,13 +83,15 @@ void TableWriter::start() {
 
 void TableWriter::stop() {
     if (!keep_running_) return;
-    
-    // Push a dummy message to wake up the worker if it's blocked on pop
-    WalMessage dummy;
-    dummy.relation_id = 0;
-    queue_.push(dummy); 
 
+    // We must signal the worker thread to stop but ONLY after draining the queue.
+    // A simple way is to set a flag and notify.
     keep_running_ = false;
+    
+    // Wake up worker if it's waiting on the queue
+    WalMessage poison_pill;
+    poison_pill.is_flush_signal = true; // Use this as a sentinel if needed
+    queue_.push(poison_pill); 
 
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -97,35 +99,28 @@ void TableWriter::stop() {
 }
 
 void TableWriter::run() {
-    while (keep_running_ || !queue_.empty()) {
+    while (true) {
         WalMessage msg;
-        if (queue_.pop_for(msg, std::chrono::milliseconds(100))) {
-            // Process ALL messages until queue is empty
-            if (msg.relation_id == 0 && !keep_running_) continue; 
-            
-            // DEBUG LOGGING
-            if (msg.is_flush_signal) {
-                std::cout << "TableWriter [" << info_.table_name << "]: Received flush signal for Epoch " << msg.epoch_id << " (Pending until next COMMIT)" << std::endl;
-                pending_epoch_ = msg.epoch_id;
-            } else if (msg.pg_msg_type == 'C') { // Commit
-                if (pending_epoch_ > 0) {
-                    std::cout << "TableWriter [" << info_.table_name << "]: COMMIT reached. Flushing Epoch " << pending_epoch_ << std::endl;
-                    flushPartition(pending_epoch_);
-                    pending_epoch_ = 0;
-                }
-            }
-            
-            if (msg.pg_msg_type == 'S') {
-                processSnapshotCopy(msg.payload.data(), msg.payload.size());
-                continue;
-            }
-
-            processInternal(msg);
+        if (!queue_.pop_for(msg, std::chrono::milliseconds(100))) {
+            if (!keep_running_) break;
+            continue;
         }
+
+        if (msg.is_flush_signal && !keep_running_) {
+            break;
+        }
+
+        if (msg.pg_msg_type == 'S') {
+            processSnapshotCopy(msg.payload.data(), msg.payload.size());
+            continue;
+        }
+
+        processInternal(msg);
     }
-    // Final flush on exit
+    
+    // Final flush of any remaining data
     if (current_rows_ > 0) {
-        flushPartition(0); // Use 0 for final exit flush if no epoch
+        flushPartition(0);
     }
 }
 
