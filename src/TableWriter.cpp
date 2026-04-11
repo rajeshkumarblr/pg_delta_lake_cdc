@@ -458,10 +458,11 @@ void TableWriter::flushPartition(uint64_t epoch_id) {
     PARQUET_THROW_NOT_OK(fs_->CreateDir(table_dir));
     
     std::string filename;
+    uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     if (epoch_id > 0) {
-        filename = info_.table_name + "_epoch_" + std::to_string(epoch_id) + ".parquet";
+        filename = info_.table_name + "_epoch_" + std::to_string(epoch_id) + "_" + std::to_string(now_us) + ".parquet";
     } else {
-        filename = info_.table_name + "_" + std::to_string(latest_lsn_) + ".parquet";
+        filename = info_.table_name + "_" + std::to_string(latest_lsn_) + "_" + std::to_string(now_us) + ".parquet";
     }
     std::string full_path = table_dir + "/" + filename;
     

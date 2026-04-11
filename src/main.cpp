@@ -90,16 +90,30 @@ int main(int argc, char *argv[]) {
     writer.start();
 
     receiver.performSnapshot();
-    receiver.receiveLoop();
 
-    std::cout << "Receiver run-loop exited. Stopping writer..." << std::endl;
-    writer.stop();
-
-  } catch (const std::exception &e) {
-    std::cerr << "Fatal Error: " << e.what() << std::endl;
-    return 1;
-  }
-
-  std::cout << "Daemon stopped cleanly.\n";
-  return 0;
+    bool first_run = true;
+    while (true) {
+        if (!first_run) {
+            std::cout << "Re-connecting to PostgreSQL for CDC..." << std::endl;
+            try {
+                receiver.connect();
+                receiver.startLogicalReplication();
+            } catch (const std::exception& e) {
+                std::cerr << "Reconnection failed: " << e.what() << ". Retrying in 5s..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+        }
+        first_run = false;
+        
+        receiver.receiveLoop();
+        
+        // If we get here, the loop finished (likely disconnect)
+        // Check if we should actually stop
+        const char* stopping = std::getenv("STOP_DAEMON");
+        if (stopping || !g_receiver) break;
+        
+        std::cout << "Logical replication stream interrupted. Re-starting in 2s..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
 }
