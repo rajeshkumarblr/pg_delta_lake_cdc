@@ -198,13 +198,6 @@ void TableWriter::resetBuilders() {
 }
 
 void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn, char pg_msg_type) {
-    if (pg_msg_type == 'S') {
-        // Process snapshot rows synchronously to ensure they are durable 
-        // before the WAL stream starts.
-        processSnapshotCopy(data, length);
-        return;
-    }
-
     WalMessage msg;
     msg.relation_id = info_.rel_id;
     msg.lsn = lsn;
@@ -215,25 +208,24 @@ void TableWriter::appendRow(const char* data, size_t length, uint64_t lsn, char 
     
     {
         std::lock_guard<std::mutex> lock(lsn_mtx_);
-        if (oldest_lsn_in_queue_ == 0) {
-            oldest_lsn_in_queue_ = lsn;
-        }
+        if (oldest_lsn_in_queue_ == 0) oldest_lsn_in_queue_ = lsn;
     }
-    
-    queue_.push(msg);
-}
-
-void TableWriter::sendFlushSignal(uint64_t epoch_id) {
-    WalMessage msg;
-    msg.is_flush_signal = true;
-    msg.epoch_id = epoch_id;
-    msg.relation_id = info_.rel_id;
     queue_.push(msg);
 }
 
 void TableWriter::forceFlush() {
-    if (current_rows_ > 0) {
-        flushPartition(0);
+    // Push a flush signal and wait for it to be processed
+    WalMessage msg;
+    msg.is_flush_signal = true;
+    msg.epoch_id = 0;
+    msg.relation_id = info_.rel_id;
+    queue_.push(msg);
+    
+    // Simple wait: spin/sleep until queue is empty and current_rows_ is 0
+    // In a prod system, use a promise/future or condition variable.
+    int retries = 0;
+    while ((!queue_.empty() || current_rows_ > 0) && retries++ < 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
