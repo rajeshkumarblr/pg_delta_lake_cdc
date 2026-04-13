@@ -26,6 +26,7 @@ public:
 
   void run();
   void stop();
+  bool isRunning() const { return keep_running_; }
   
   std::string getSnapshotId() const { return snapshot_id_; }
   uint64_t getWatermarkLsn() const { return watermark_lsn_; }

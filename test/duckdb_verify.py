@@ -35,12 +35,24 @@ def verify():
     print("Waiting 30 seconds for final epochs to flush...")
     time.sleep(30)
 
-    # Use DuckDB to read Parquet files directly
-    con = duckdb.connect()
+    # Wait for Parquet files to appear (timeout 60s)
+    import glob
+    retries = 12
+    parquet_pattern = os.path.join(delta_path, "**", "*.parquet")
+    while retries > 0:
+        files = glob.glob(parquet_pattern, recursive=True)
+        if len(files) > 0:
+            print(f"Found {len(files)} parquet files. Proceeding with audit...")
+            break
+        print(f"Waiting for parquet files at {parquet_pattern}... ({retries} retries left)")
+        time.sleep(5)
+        retries -= 1
     
-    # 1. Integrity Check (Count and Sum)
-    # We read all parquet files in the table directory
-    parquet_pattern = os.path.join(delta_path, "*.parquet")
+    if retries == 0:
+        print("No parquet files appeared in time!")
+        sys.exit(1)
+
+    con = duckdb.connect()
     query = f"""
         SELECT 
             count(*) as cnt,
@@ -60,25 +72,25 @@ def verify():
     # 2. Rollback Verification (Negative Test)
     # Rows 80000-80009 were rolled back in PG, so they should NOT be in Delta
     rollback_check = con.execute(f"""
-        SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True)
+        SELECT count(*) FROM read_parquet('/app/data/integration_test/**/*.parquet', union_by_name=True)
         WHERE id BETWEEN 80000 AND 80009
     """).fetchone()[0]
 
     # 3. Schema Evolution Verification
     # Check if 'priority' and 'tags' columns exist and have expected values
-    schema_check = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{parquet_pattern}', union_by_name=True)").fetchall()
+    schema_check = con.execute(f"DESCRIBE SELECT * FROM read_parquet('/app/data/integration_test/**/*.parquet', union_by_name=True)").fetchall()
     column_names = [r[0] for r in schema_check]
     has_evolved_cols = "priority" in column_names and "tags" in column_names
     
     # 5. Check for DELETE operations (Bronze layer)
-    res_delete = con.execute(f"SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True) WHERE _cdc_op = 'DELETE'").fetchone()[0]
+    res_delete = con.execute(f"SELECT count(*) FROM read_parquet('/app/data/integration_test/**/*.parquet', union_by_name=True) WHERE _cdc_op = 'DELETE'").fetchone()[0]
     
     # 7. Snapshot Verification
-    res_snapshot = con.execute(f"SELECT count(*) FROM read_parquet('{parquet_pattern}', union_by_name=True) WHERE _cdc_op = 'SNAPSHOT'").fetchone()[0]
+    res_snapshot = con.execute(f"SELECT count(*) FROM read_parquet('/app/data/integration_test/**/*.parquet', union_by_name=True) WHERE _cdc_op = 'SNAPSHOT'").fetchone()[0]
     print(f"Snapshot Records (Historical): {res_snapshot} (Expected: 100)")
 
     # 6. Secondary Table Verification
-    secondary_path = "/app/data/secondary_test/*.parquet"
+    secondary_path = "/app/data/secondary_test/**/*.parquet"
     res_secondary = 0
     if os.path.exists("/app/data/secondary_test"):
          res_secondary = con.execute(f"SELECT count(*) FROM read_parquet('{secondary_path}')").fetchone()[0]

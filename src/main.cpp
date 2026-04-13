@@ -99,22 +99,28 @@ int main(int argc, char *argv[]) {
                 receiver.connect();
                 receiver.startLogicalReplication();
             } catch (const std::exception& e) {
-                std::cerr << "Reconnection failed: " << e.what() << ". Retrying in 5s..." << std::endl;
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                continue;
+                std::cerr << "Reconnection failed: " << e.what() << ". Exiting." << std::endl;
+                break;
             }
         }
         first_run = false;
         
-        receiver.receiveLoop();
+        try {
+            receiver.receiveLoop();
+        } catch (const std::exception& e) {
+            std::cerr << "Receive loop error: " << e.what() << std::endl;
+        }
         
         // If we get here, the loop finished (likely disconnect)
-        // Check if we should actually stop
-        const char* stopping = std::getenv("STOP_DAEMON");
-        if (stopping || !g_receiver) break;
-        
-        std::cout << "Logical replication stream interrupted. Re-starting in 2s..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (!receiver.isRunning()) {
+            std::cout << "Daemon shutdown requested via signal." << std::endl;
+            break;
+        }
+
+        // Stop reconnection for now - reconnecting replays data without
+        // proper LSN tracking, causing duplicates
+        std::cout << "Replication stream ended. Daemon exiting cleanly." << std::endl;
+        break;
     }
   } catch (const std::exception &e) {
     std::cerr << "Fatal Error: " << e.what() << std::endl;

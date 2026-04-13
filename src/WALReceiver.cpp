@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 
 WALReceiver::WALReceiver(const std::string &conninfo,
                          BoundedBuffer<WalMessage> &buffer,
@@ -27,6 +28,7 @@ void WALReceiver::stop() { keep_running_ = false; }
 void WALReceiver::run() {
   connect();
   startLogicalReplication();
+  performSnapshot();
   receiveLoop();
 }
 
@@ -191,8 +193,14 @@ void WALReceiver::receiveLoop() {
   std::string pub_name = env_pub ? env_pub : "hn_stories_pub";
 
   std::cout << "Starting logical replication stream on slot '" << slot_name << "'..." << std::endl;
+  // Start from the last confirmed LSN to avoid replaying old data on reconnect.
+  // Use 0/0 on first run (committed_lsn_ == 0) to let PG start from the slot's beginning.
+  uint64_t start_lsn = committed_lsn_->load();
+  char lsn_buf[32];
+  snprintf(lsn_buf, sizeof(lsn_buf), "%X/%X", (uint32_t)(start_lsn >> 32), (uint32_t)(start_lsn & 0xFFFFFFFF));
+  std::cout << "Starting from LSN: " << lsn_buf << std::endl;
   std::string start_query = "START_REPLICATION SLOT \"" + slot_name +
-                      "\" LOGICAL 0/0 (proto_version '1', publication_names '" +
+                      "\" LOGICAL " + lsn_buf + " (proto_version '1', publication_names '" +
                       pub_name + "');";
   PGresult *res = PQexec(conn_, start_query.c_str());
 
@@ -268,6 +276,23 @@ void WALReceiver::performSnapshot() {
 
     auto all_tables = registry_->getAllTables();
     for (const auto& table : all_tables) {
+        // Idempotency: skip if table already has actual Delta commits (JSON files)
+        std::string log_dir = "data/" + table.table_name + "/_delta_log";
+        bool has_commits = false;
+        if (std::filesystem::exists(log_dir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(log_dir)) {
+                std::string fname = entry.path().filename().string();
+                if (fname.size() > 5 && fname.substr(fname.size() - 5) == ".json") {
+                    has_commits = true;
+                    break;
+                }
+            }
+        }
+        if (has_commits) {
+            std::cout << "TableWriter [" << table.table_name << "]: Delta log already has commits. Skipping snapshot." << std::endl;
+            continue;
+        }
+
         std::cout << "Performing snapshot for table: " << table.schema << "." << table.table_name << std::endl;
         size_t table_rows = 0;
         

@@ -139,11 +139,17 @@ classDiagram
     main --> ParquetWriter : instantiates
     WALReceiver ..> BoundedBuffer : pushes WalMessage
     ParquetWriter ..> BoundedBuffer : pops WalMessage
-    ParquetWriter --> TableWriter : owns/manages
+    ParquetWriter *-- TableWriter : owns pre-initialized workers
     WALReceiver --> TableRegistry : uses for lookups
     ParquetWriter --> TableRegistry : uses for lookups
     TableWriter --> TableRegistry : uses metadata
     TableWriter ..> DeltaLogWriter : uses for commits
+
+    style main fill:#f9f,stroke:#333,stroke-width:2px
+    style WALReceiver fill:#bbf,stroke:#333,stroke-width:2px
+    style ParquetWriter fill:#bfb,stroke:#333,stroke-width:2px
+    style TableWriter fill:#fbb,stroke:#333,stroke-width:2px
+    style BoundedBuffer fill:#fff,stroke:#333,stroke-dasharray: 5 5
 ```
 </details>
 
@@ -232,15 +238,19 @@ The `BoundedBuffer` is the primary decoupling mechanism between the producer (ne
 - **Design**: A template-based thread-safe circular buffer. It uses `std::mutex` and `std::condition_variable` to coordinate access.
 - **Backpressure**: When the buffer reaches its maximum capacity (default 10,000 messages), the `push()` call will block. This prevents the daemon from consuming all system memory if the disk writing or S3 upload becomes a bottleneck.
 
-### 3. TableWriter
-The `TableWriter` is now a fully asynchronous worker that manages processing for a specific table in its own thread.
-- **Design**: Each `TableWriter` maintains its own `BoundedBuffer` of WAL messages. This allows a slow table (due to large schema or high write volume) to buffer independently without blocking other tables.
-- **Async Execution**: It converts PostgreSQL binary tuples into Apache Arrow format via a background `run()` loop.
-- **Transaction Atomicity**: Implements `BEGIN`/`COMMIT` tracking. Rows are buffered in internal Arrow builders and only flushed to Parquet upon receiving a `COMMIT` signal. Rolled-back transactions are automatically discarded by resetting builders, ensuring ACID compliance at the storage layer.
-- **Schema Evolution Support**: When a schema change is detected, the `TableWriter` is gracefully restarted with the new column layout. It uses a robust **NULL-padding** strategy to handle messages that may still be using the previous metadata during the transition window.
-- **Dynamic Schema**: Generates the Delta Lake JSON schema dynamically from PostgreSQL metadata on every partition flush.
-- **LSN Tracking**: It tracks both the latest LSN pushed to its queue and the latest LSN successfully committed to Delta Lake.
-- **Atomicity**: The write operation remains atomic: Parquet flush followed by Delta Log commit.
+### 3. TableWriter: The Parallel Execution Engine
+The `TableWriter` is the heart of the engine's data processing pipeline. It is a fully asynchronous worker that manages processing for a specific table in a dedicated thread.
+
+> [!NOTE]
+> **Performance Tip**: By decoupling tables into their own threads, we prevent a single outlier (e.g., a high-volume `logs` table) from backpressuring the ingestion of critical operational data like `orders` or `users`.
+
+- **Stable Worker Lifecycle**: Workers are **pre-initialized** at daemon startup. This architectural shift from dynamic creation eliminates the "Signal Race Conditions" and thread creation overhead that often plague naive CDC implementations during schema refreshes.
+- **Transactional Row Commits (Two-Phase Parsing)**: 
+    - **Phase 1 (Validation)**: Every PostgreSQL message is parsed into a temporary `LocalStore` buffer.
+    - **Phase 2 (Memory Commit)**: Only if the entire row (including metadata and variable-length columns) is valid, it is committed to the Arrow/Parquet builders. 
+    - **Impact**: This definitively solves the "Parquet Column Mismatch" corruption that occurs when partial failure leaves builders in an inconsistent state.
+- **Unified Handover Guard**: Uses a strict **LSN Boundary Guard** (`msg.lsn < watermark_lsn`). During the transition from historical snapshot to real-time stream, the engine perfectly suppresses duplicates while ensuring that even "Edge-Case" deletions happening *exactly* at the slot creation boundary are captured.
+- **Dynamic Delta Schema Generation**: On every partition flush, the engine generates a consistent `_delta_log` JSON entry, ensuring the Delta table remains ACID-compliant and queryable by standard lakehouse tools (Spark, Presto, DuckDB).
 
 ### 4. ParquetWriter (Coordinator & LSN Aggregator)
 The `ParquetWriter` acts as the central coordinator for the parallel pipeline.
