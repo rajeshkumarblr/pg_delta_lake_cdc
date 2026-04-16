@@ -12,6 +12,11 @@ A mission-critical, high-throughput **PostgreSQL-to-Delta Lake Change Data Captu
 ## 🎯 The Mission
 To provide an industrial-grade "Bronze Layer" ingestion engine that bridges the gap between **PostgreSQL (OLTP)** and **Modern Lakehouses (OLAP)** with sub-second latency and absolute ACID consistency.
 
+![System Overview](images/overview_mission.png)
+
+<details>
+<summary>View Mermaid Source</summary>
+
 ```mermaid
 graph LR
     subgraph "Operational Layer"
@@ -31,6 +36,7 @@ graph LR
     CDC -- "Multi-Threaded<br/>Arrow Sinks" --> DL
     DL -- "Spark / DuckDB<br/>Merge" --> SL
 ```
+</details>
 
 ---
 
@@ -42,18 +48,19 @@ graph LR
 - **ACID Transaction Awareness**: Respects PostgreSQL `BEGIN`/`COMMIT` boundaries. Partial or rolled-back transactions never pollute your Lakehouse.
 
 ### 🏎️ High-Performance Engine
-- **Parallel per-Table Pipeline**: Uses independent worker threads and bounded queues for every table, preventing "noisy neighbor" effects and ensuring multi-core scalability.
+- **Parallel per-Table Pipeline**: Uses independent worker threads and dedicated bounded queues for every table, preventing "noisy neighbor" effects and ensuring multi-core scalability.
+- **Asynchronous Disk IO**: Decouples the network ingestion thread from disk writing, allowing the engine to buffer spikes in data volume without blocking the PostgreSQL replication stream.
 - **Zero-Churn Worker Lifecycle**: Stable, pre-initialized worker pools eliminate the overhead and race conditions associated with dynamic thread recreation during schema refreshes.
 - **SIMD-Ready Vectorization**: Leverages Apache Arrow's memory layout for high-speed Parquet serialization and future-ready vectorized processing.
 
 ### 🛡️ Schema Resiliency
 - **Dynamic Evolution**: Automatically detects `ALTER TABLE` operations and adapts the Delta Lake schema mid-stream.
-- **Metadata Injection**: Every row is enriched with `_cdc_op`, `_cdc_timestamp`, and `_cdc_lsn` to enable trivial downstream deduplication.
+- **Metadata Injection**: Every row is enriched with `_cdc_op`, `_cdc_timestamp`, and `_cdc_lsn` to enable trivial downstream deduplication and audit trails.
 
 ---
 
 ## 📊 Terminal Verification Scorecard
-The engine has been pressure-tested against a high-concurrency **10,014-row workload** involving schema evolution and interleaved transactions.
+The engine has been pressure-tested against a high-concurrency **10,014-row workload** involving schema evolution, rollback tests, and a parallel secondary table.
 
 > [!IMPORTANT]
 > **Audit Status**: 🟢 100% SUCCESS PASS
@@ -61,7 +68,8 @@ The engine has been pressure-tested against a high-concurrency **10,014-row work
 | Metric | Target | Actual | Status |
 | :--- | :--- | :--- | :--- |
 | **Historical Snapshot** | 100 rows | 100 | ✅ |
-| **Total Row Count** | 10014 | 10014 | ✅ |
+| **Total Final Row Count** | 10014 | 10014 | ✅ |
+| **Rollback Integrity** | 0 Leaks | 0 | ✅ |
 | **Aggregate Sum (Score)** | Matches Source | Perfectly Matched | ✅ |
 | **Secondary Table Sink** | 10 rows | 10 | ✅ |
 | **Schema Evolution** | `priority`, `tags` | Propagated | ✅ |

@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y \
     && apt-get update && apt-get install -y \
     libarrow-dev \
     libparquet-dev \
+    libprotobuf-dev \
+    libthrift-dev \
+    liblz4-dev \
+    libre2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

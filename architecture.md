@@ -3,7 +3,12 @@
 This document describes the high-level architecture, threading model, and the **Medallion Architecture** data flow of the PostgreSQL CDC pipeline.
 
 > [!TIP]
-> **Mermaid Support in IDE**: The diagrams below are pre-rendered for maximum compatibility. If you wish to edit them, please modify the Mermaid blocks in the source. To enable native rendering in VS Code, install the **"Markdown Preview Mermaid Support"** extension.
+> **Mermaid Support in IDE**:
+> 1. **Native Rendering**: Install the **"Markdown Preview Mermaid Support"** extension (ID: `bierner.markdown-mermaid`).
+> 2. **Pre-rendered Images**: The diagrams are pre-rendered in the `images/` directory. To update them after modifying the source, run:
+>    ```bash
+>    python3 scripts/render_diagrams.py
+>    ```
 
 ## End-to-End Data Flow (Medallion Architecture)
 
@@ -65,10 +70,18 @@ classDiagram
         -BoundedBuffer& buffer
         -TableRegistryPtr registry
         -atomic~uint64_t~* committed_lsn
+        -uint64_t watermark_lsn_
         +run()
         +stop()
+        +connect()
+        +startLogicalReplication()
+        +performSnapshot()
+        +getWatermarkLsn()
         -receiveLoop()
         -handleCopyData()
+        -handleRelationMessage()
+        -handleDataMessage()
+        -handleKeepAliveMessage()
         -sendStandbyStatusUpdate(lsn)
     }
 
@@ -77,12 +90,16 @@ classDiagram
         -TableRegistryPtr registry
         -atomic~uint64_t~* committed_lsn
         -unordered_map<uint32_t, TableWriterPtr> writers
-        -uint64_t current_epoch_id
+        -uint64_t current_epoch_id_
+        -uint64_t current_max_lsn_
+        -uint64_t pending_epoch_id_
+        -uint64_t pending_epoch_lsn_
         +start()
         +stop()
         -run()
         -processMessage()
         -broadcastFlushSignal(epoch_id)
+        -stopAllWriters()
     }
 
     class TableWriter {
@@ -92,6 +109,7 @@ classDiagram
         -BoundedBuffer~WalMessage~ queue
         -thread worker_thread
         -atomic~uint64_t~ committed_lsn_val
+        -atomic~uint64_t~ last_flushed_epoch_
         -uint64_t insert_count_
         -uint64_t update_count_
         -uint64_t delete_count_
@@ -99,9 +117,13 @@ classDiagram
         +stop()
         +appendRow()
         +sendFlushSignal(epoch_id)
+        +forceFlush()
+        +getOldestPendingLSN()
+        +processSnapshotCopy()
         -run()
         -processInternal()
         -flushPartition(epoch_id)
+        -setupSchemaAndBuilders()
         -generateDeltaSchemaJSON()
     }
 
@@ -111,6 +133,7 @@ classDiagram
         +vector~char~ payload
         +bool is_flush_signal
         +uint64_t epoch_id
+        +char pg_msg_type
     }
 
     class DeltaLogWriter {
@@ -122,8 +145,10 @@ classDiagram
         -unordered_map<string, TableInfo> tables
         -unordered_map<uint32_t, TableInfo> active_relations
         +addTable()
+        +getTable()
         +mapRelationId()
         +getTableByRelationId()
+        +getAllTables()
     }
 
     class BoundedBuffer~T~ {
@@ -175,26 +200,38 @@ sequenceDiagram
 
     loop CDC Loop
         PG->>WR: CopyData (WAL Message)
-        Note over WR: Capture repl_ident + pk_flag
+        Note over WR: Extract LSN + Message Type
         WR->>BB: push_for(WalMessage, timeout)
         
-        Note over PW: Coordinator
-        BB->>PW: Drain available messages
-        PW->>TW: dispatch to queue
-        
-        opt Epoch Trigger (Batch or Commit)
-            PW->>TW: sendFlushSignal(epoch_id)
-            Note over TW: Parallel worker flush
+        loop Coordinator Tick
+            BB->>PW: Drain available messages
+            PW->>TW: appendRow(payload, lsn, type)
+            Note over PW: Update current_max_lsn_
+            
+            opt Epoch Trigger (10s or 50k rows)
+                PW->>PW: Set pending_epoch_id_
+                PW->>TW: sendFlushSignal(epoch_id)
+            end
+
+            opt Check Epoch Completion
+                PW->>TW: getLastFlushedEpoch()
+                Note over PW: All writers finished?
+                PW->>PW: committed_lsn.store(pending_lsn)
+                PW->>PW: Reset pending_epoch_id_
+            end
+        end
+
+        Note over TW: Parallel worker execution
+        TW->>TW: processInternal()
+        opt Flush Condition
             TW->>TW: flushPartition(epoch_id)
             TW->>DL: writeCommit(fs_, dynamic_schema)
-            TW->>TW: Update last_flushed_epoch
-            PW->>TW: Check getLastFlushedEpoch()
-            PW->>PW: Advance global committed_lsn
+            TW->>TW: Update last_flushed_epoch_
         end
         
         Note over WR: Independent Status Loop
         opt Periodic Heartbeat (5s)
-            WR->>PG: StandbyStatusUpdate(global_lsn)
+            WR->>PG: StandbyStatusUpdate(committed_lsn)
         end
     end
 ```
@@ -238,26 +275,27 @@ The `BoundedBuffer` is the primary decoupling mechanism between the producer (ne
 - **Design**: A template-based thread-safe circular buffer. It uses `std::mutex` and `std::condition_variable` to coordinate access.
 - **Backpressure**: When the buffer reaches its maximum capacity (default 10,000 messages), the `push()` call will block. This prevents the daemon from consuming all system memory if the disk writing or S3 upload becomes a bottleneck.
 
-### 3. TableWriter: The Parallel Execution Engine
+#### 3. TableWriter: The Parallel Execution Engine
 The `TableWriter` is the heart of the engine's data processing pipeline. It is a fully asynchronous worker that manages processing for a specific table in a dedicated thread.
 
 > [!NOTE]
 > **Performance Tip**: By decoupling tables into their own threads, we prevent a single outlier (e.g., a high-volume `logs` table) from backpressuring the ingestion of critical operational data like `orders` or `users`.
 
 - **Stable Worker Lifecycle**: Workers are **pre-initialized** at daemon startup. This architectural shift from dynamic creation eliminates the "Signal Race Conditions" and thread creation overhead that often plague naive CDC implementations during schema refreshes.
+- **Asynchronous Queueing**: Every table worker maintains its own `BoundedBuffer` queue. The coordinator pushes messages to these queues, allowing the main ingestion stream to continue uninterrupted even if a specific table's disk IO is slow.
+- **Unified Handover Guard**: Uses a strict **LSN Boundary Guard** (`msg.lsn < watermark_lsn`). During the transition from historical binary `COPY` snapshot to real-time stream, the engine perfectly suppresses duplicates while ensuring that even "Edge-Case" deletions happening *exactly* at the slot creation boundary are captured.
 - **Transactional Row Commits (Two-Phase Parsing)**: 
-    - **Phase 1 (Validation)**: Every PostgreSQL message is parsed into a temporary `LocalStore` buffer.
+    - **Phase 1 (Validation)**: Every PostgreSQL message is parsed into a temporary local buffer.
     - **Phase 2 (Memory Commit)**: Only if the entire row (including metadata and variable-length columns) is valid, it is committed to the Arrow/Parquet builders. 
     - **Impact**: This definitively solves the "Parquet Column Mismatch" corruption that occurs when partial failure leaves builders in an inconsistent state.
-- **Unified Handover Guard**: Uses a strict **LSN Boundary Guard** (`msg.lsn < watermark_lsn`). During the transition from historical snapshot to real-time stream, the engine perfectly suppresses duplicates while ensuring that even "Edge-Case" deletions happening *exactly* at the slot creation boundary are captured.
 - **Dynamic Delta Schema Generation**: On every partition flush, the engine generates a consistent `_delta_log` JSON entry, ensuring the Delta table remains ACID-compliant and queryable by standard lakehouse tools (Spark, Presto, DuckDB).
 
-### 4. ParquetWriter (Coordinator & LSN Aggregator)
+### 4. ParquetWriter (Coordinator & Epoch Manager)
 The `ParquetWriter` acts as the central coordinator for the parallel pipeline.
-- **Global Epoch Coordination**: Implements cross-table ACID consistency by triggering global "epochs".
-- **Barrier Synchronization**: Periodically broadcasts flush signals to all active `TableWriter` threads.
-- **Non-blocking State Machine**: Uses a non-blocking synchronization loop that allows the engine to continue processing WAL messages while waiting for epoch confirmation, ensuring that replication heartbeats are never interrupted.
-- **Min-LSN Safety Mechanism**: Ensures that the global replication slot only advances to the minimum LSN successfully committed across all parallel tables, preventing data loss on restarts.
+- **Global Epoch Coordination**: Implements cross-table consistency by triggering and monitoring global "epochs". An epoch is triggered every 10 seconds or every 50,000 processed rows.
+- **Barrier Synchronization**: Broadcasts flush signals to all active `TableWriter` threads when an epoch is triggered.
+- **Non-blocking State Machine**: Uses an asynchronous check loop to monitor `getLastFlushedEpoch()` from all writers. It only advances the global committed LSN after all writers have successfully flushed the epoch to storage.
+- **Min-LSN Safety Mechanism**: This ensures that the global replication slot in PostgreSQL only advances to a point where data is guaranteed to be persistent in Delta Lake.
 
 ### 5. DeltaLogWriter
 A static utility class that implements the **Delta Lake Transaction Log Protocol**.

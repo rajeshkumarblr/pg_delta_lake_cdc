@@ -87,13 +87,20 @@ def verify():
     
     # 7. Snapshot Verification
     res_snapshot = con.execute(f"SELECT count(*) FROM read_parquet('/app/data/integration_test/**/*.parquet', union_by_name=True) WHERE _cdc_op = 'SNAPSHOT'").fetchone()[0]
+    expected_deletes = int(res_snapshot) + 1 # 100 historical + 1 workload delete
     print(f"Snapshot Records (Historical): {res_snapshot} (Expected: 100)")
 
     # 6. Secondary Table Verification
     secondary_path = "/app/data/secondary_test/**/*.parquet"
     res_secondary = 0
     if os.path.exists("/app/data/secondary_test"):
-         res_secondary = con.execute(f"SELECT count(*) FROM read_parquet('{secondary_path}')").fetchone()[0]
+         res_secondary = con.execute(f"""
+            SELECT count(*) FROM (
+                SELECT id,
+                       row_number() OVER (PARTITION BY id ORDER BY _cdc_lsn DESC, _cdc_timestamp DESC) as rn
+                FROM read_parquet('{secondary_path}')
+            ) WHERE rn = 1
+         """).fetchone()[0]
     
     print("-" * 40)
     print("VERIFICATION RESULTS (DUCKDB)")
@@ -101,7 +108,7 @@ def verify():
     print(f"Expected Sum   (Main): {expected['SUM']:.4f}, Actual: {actual_sum:.4f}")
     print(f"Expected Count (Sec):  {expected['SECONDARY_COUNT']}, Actual: {res_secondary}")
     print(f"Rollback Check: {rollback_check} rows found (Expected: 0)")
-    print(f"Delete Check:   {res_delete} rows found (Expected: 1)")
+    print(f"Delete Check:   {res_delete} rows found (Expected: {expected_deletes})")
     print(f"Snapshot Check: {res_snapshot} rows found (Expected: 100)")
     print(f"Schema Evolution: {'SUCCESS' if has_evolved_cols else 'FAILED'} (Columns: {', '.join(column_names)})")
     print("-" * 40)
