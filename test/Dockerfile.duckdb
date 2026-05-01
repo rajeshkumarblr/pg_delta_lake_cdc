@@ -1,0 +1,5 @@
+FROM python:3.11-slim-bookworm
+RUN pip install duckdb
+WORKDIR /app
+COPY duckdb_verify.py .
+CMD ["sleep", "3600"]

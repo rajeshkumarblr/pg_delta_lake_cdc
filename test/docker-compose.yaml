@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hn_user
+      POSTGRES_PASSWORD: YOUR_PASSWORD
+      POSTGRES_DB: my_hn
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hn_user -d my_hn"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  hn-ingest:
+    build:
+      context: ./hn_ingest
+    environment:
+      DATABASE_URL: postgresql://hn_user:YOUR_PASSWORD@postgres:5432/my_hn?sslmode=disable
+    command: ["./ingest", "--interval", "10s", "--stress"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  
+  cdc-daemon:
+    build:
+      context: ../
+    environment:
+      PG_CONNINFO: postgresql://hn_user:YOUR_PASSWORD@postgres:5432/my_hn?sslmode=disable
+      PG_SLOT_NAME: hn_stories_slot
+      PG_PUBLICATION_NAME: hn_stories_pub
+      OUTPUT_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  workload-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.workload
+    environment:
+      DATABASE_URL: postgresql://hn_user:YOUR_PASSWORD@postgres:5432/my_hn?sslmode=disable
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cdc-daemon:
+        condition: service_started
+
+  duckdb-verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.duckdb
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  postgres_data:

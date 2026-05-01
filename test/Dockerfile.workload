@@ -1,0 +1,5 @@
+FROM python:3.11-slim
+RUN pip install psycopg2-binary
+WORKDIR /app
+COPY generate_workload.py .
+CMD ["python", "generate_workload.py"]

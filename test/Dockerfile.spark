@@ -1,0 +1,6 @@
+FROM python:3.11-slim-bookworm
+RUN apt-get update && apt-get install -y openjdk-17-jre-headless && rm -rf /var/lib/apt/lists/*
+RUN pip install pyspark==3.5.0 delta-spark==3.1.0
+WORKDIR /app
+COPY pyspark_verify.py .
+CMD ["python", "pyspark_verify.py"]
